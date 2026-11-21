@@ -5,8 +5,11 @@ Ported from **Simple Backups 1.21-4.0.30** (`ChaoticTrials/SimpleBackups`,
 
 Status: **implemented; verified in game at 0.1.0** — 15 runtime tests, `stage → check → test →
 build` green, and the backup scenarios pass (see below). **Republished as the SDK package
-0.2.0** on 2026-11-18: 23 tests, clippy/fmt clean, `check`/`fits` green, artifact reproducible;
-**not yet re-run in game** (no launcher here) — see *Migration to the SDK format*.
+0.2.0** on 2026-11-18: 23 tests, clippy/fmt clean, `check`/`fits` green, artifact reproducible.
+**0.2.1** fixed the registry review's four findings and re-ran the leg in a launcher-built game.
+**0.2.2** (2026-11-21) is the disk-cap slice: `max_disk_size` (upstream `maxDiskSize`, 25 GB
+default) prunes the oldest archives after a good backup, repinned to Horizon `0a875da`; 36 tests,
+`check`/`fits` green, and the new cap scene (with its counterfactual) passed in game.
 
 **Class + tier** (from `ports/ledger.csv`, per `horizon/docs/modpacks.md`):
 **server-only / logic**. The approach is the **logic shape**: a pure policy
@@ -48,6 +51,159 @@ module, and `/simplebackups` commands; there is no carried content and no
 | `perform_command` (v1, API 8) | `perform.rs` | Queue/answer them. |
 
 Skills: superpowers/using-superpowers,verification-before-completion; BeautifulRust/rust-best-practices
+
+## Review fixes (2026-11-18) — registry review #1259
+
+| Finding | Fix | Test / proof |
+|---|---|---|
+| `src/runtime.rs:114` — `backups_dir` accepted absolute paths and parent traversal, and a symlink could redirect the writes/deletes (support.rs:451, :553) | `safe_backups_dir` normalises the setting (`.` dropped, `..`/absolute refused, empty → default) and `owned_dir` canonicalises the folder and refuses one that resolves outside the world before any write or prune | `runtime::tests::{a_backup_folder_may_not_leave_the_world, an_unsafe_backups_dir_is_refused_and_the_default_kept}`, `support::tests::a_backups_folder_that_resolves_outside_the_world_is_refused` |
+| `src/support.rs:500` — `File::create` followed a pre-existing `.zip.part` link and truncated its target | the staging entry is removed (a link itself, not its target) and re-created with `create_new(true)` | `support::tests::a_planted_staging_symlink_is_not_followed_or_truncated` (watched failing with the old `File::create`) |
+| `src/runtime.rs:286` — the walk normalised the visited path but compared it with the raw configured output prefix, so `./backups` was copied into the next archive | `should_skip` normalises the prefix with the same `normalise` (and the glue passes the **resolved** folder's relative path), so the real output subtree is always excluded | `runtime::tests::a_dot_spelled_output_folder_is_still_excluded_from_the_zip` |
+| `Cargo.toml:11` / licence — the SHA-bound package said MIT while the registry and upstream say Apache-2.0 | the outbound licence is **resolved to Apache-2.0**: `LICENSE` is the Apache text, `Cargo.toml` and `horizon-mod.toml` declare it, and `LICENSE-NOTICE.md`/`README.md` say so | `unzip -p simplebackups.hmod horizon-mod.toml`/`Cargo.toml`; the entry's fields are the orchestrator's |
+
+The port-local `Config` type was renamed `Settings` (its name collided with the SDK's `Config`,
+which `fits` flagged as a changed item on the newest Nightly); behaviour is unchanged.
+
+**Found while proving the leg:** the zip writer read each file **twice** (a checksum pass, then
+a copy), so a chunk the game wrote in between produced an entry whose CRC failed on read-back
+(`check_zip`'s `testzip`). It now copies in one pass with a data descriptor (flag bit 3) and
+the CRC always matches the bytes stored. The save-overlap scenario can only be overlapped by a
+*second* world save, which single player cannot produce (no `/save-all`; the administration
+profile is the dedicated server's, and pause/resume does not save here) — the rule is pinned by
+`support::tests::an_overlapped_copy_is_redone_only_within_the_rule` and the e2e prints a `SKIP`
+line for the two overlap runs rather than asserting on a save it cannot make. **Ladder:** 29
+tests, clippy `-D warnings` 0, `fmt --check` clean, two builds byte-identical, `check` and `fits`
+exit 0; `launcher-game.sh run simplebackups` → `PASS` + `EXIT:0`, `GAME=$CONTROL_GAME` →
+`EXIT:1` (`../_shared/evidence/simplebackups-e2e/`).
+
+Package 0.2.1: **35,073 B**, SHA-256 `6565f5acd73b5c03f2f49f3009b8a520cf945b25daec1f08d9f7869448b978a2`;
+a second build is byte-identical (`cmp`), `check` and `fits` exit 0.
+
+## Slice 2 (0.2.2, 2026-11-21) — the disk cap (`max_disk_size`)
+
+**Gap it closes** (this file, *Gaps / deviations* → deferred, and *Gaps after the migration* item 4:
+"… a disk cap"). Upstream's `maxDiskSize` (`CommonConfig.java:80-83`, parsed by
+`StorageSize.java:32-37`, enforced by `BackupThread.java:154-178`): after a good backup, delete the
+oldest files until the folder is under the cap; if only one file is left, report an error and stop.
+At 0.2.1 the only bound on disk use was `keep`, so ten 25 GB archives could fill a volume.
+
+**Pin moved with this slice** (the 2026-11-21 repin): `[native] horizon` `0b14f8a` → **`0a875da`**,
+mixins unchanged (`e59da909`), `api = "0.2"`. `.horizon/sdk` was deleted and re-fetched so the
+build really used the new surface (`SDK 0a875da (build 0a875da9…) in ./.horizon/sdk`) — the trap
+that bit `hostilenetworks`; repinning the manifest alone does not refresh the cached SDK.
+
+**Rules (pure, `src/runtime.rs`).** `parse_size` accepts upstream's `"<n> <unit>"` with binary
+`B/KB/MB/GB/TB` (case- and space-insensitive, a bare number is bytes, a non-integer or an
+overflowing value is refused); `format_size_setting` writes the largest exactly-dividing unit, so
+the default file carries `max_disk_size = "25 GB"` and the key round-trips. `cap_removals` counts
+**every regular file in the folder** (upstream's folder size) but its removal set is only this
+world's `<world>_*.zip`, oldest name first (the names are UTC timestamps), and it always stops with
+one archive left; `over` is the "still over the cap" state upstream reports and stops on.
+
+`runtime.rs` is therefore **no longer byte-identical to the retired bundle** (the 0.2.1 review fixes
+had already changed it; this slice adds the cap): sha256 `150a2d7e…`.
+`src/{lib,support,zip}.rs` are unchanged in shape; `src/support.rs` gained the glue.
+
+**Glue.** `publish` enforces the cap after the `keep` prune (`support::enforce_cap`), records the
+folder's size and the `over` flag on the state, and `/simplebackups status` gained one line —
+`disk=<size> cap=<size> over=<bool>` — after the four lines that stay byte-identical, so the older
+scenario assertions still match. The completion broadcast appends `; removed N over the disk cap`
+and, when one archive is left and it is still too big, `; still over the disk cap (… of …)`.
+
+**Deliberate deviations (safety, recorded).** The cap never deletes a foreign file — only
+`<world>_*.zip`, the same rule `keep` already had — while upstream deletes every file in the folder;
+it counts foreign files toward the total, so no bytes are hidden from the cap. Deletion still happens
+after a successful publish, never before the copy (the 0.1.0 rule).
+
+**Red → green.** The five cap rules were written as failing tests first, against stubs that returned
+nothing; verbatim (`sdk-test-red.log`):
+
+```
+---- runtime::tests::the_cap_removes_the_oldest_archives_first_but_never_the_last stdout ----
+thread 'runtime::tests::the_cap_removes_the_oldest_archives_first_but_never_the_last' (3104017) panicked at src/runtime.rs:684:9:
+assertion `left == right` failed
+  left: []
+ right: ["W_1.zip", "W_2.zip"]
+
+failures:
+    runtime::tests::an_unparsable_disk_cap_keeps_the_default_and_warns
+    runtime::tests::sizes_are_parsed_with_binary_units
+    runtime::tests::sizes_render_in_the_largest_exact_unit
+    runtime::tests::the_cap_counts_the_folder_but_only_deletes_our_archives
+    runtime::tests::the_cap_removes_the_oldest_archives_first_but_never_the_last
+    runtime::tests::the_disk_cap_defaults_to_upstreams_25_gb
+
+test result: FAILED. 29 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+```
+
+The in-game assertion is scenario D of `tools/e2e.sh`, fail-capable twice over: a **1 B** cap with
+`keep = 3` must leave exactly the **newer** archive and report `over=true`, while the same scene
+with a **1 TB** cap must leave **both** (the counterfactual). A package without the cap keeps two in
+both runs and fails the first assertion.
+
+**Measured in game** (launcher-built game `native-0a875da-1c11ca957601`, sources byte-identical to
+this tree — `../_shared/evidence/simplebackups-e2e/build-record.txt`):
+
+```
+cap 1 B: first backup …/SimpleBackupsCap_2026-11-21_09-10-27.zip
+status: disk=10177137 B cap=1 B over=true saves=0 retries=0 stale=false in_flight=false last=SimpleBackupsCap_2026-11-21_09-10-38.zip …
+zip entries: 20
+cap enforced: the oldest archive was removed, …/SimpleBackupsCap_2026-11-21_09-10-38.zip kept
+list: SimpleBackupsCap_2026-11-21_09-10-38.zip (9.7 MB) …
+== scenario D counterfactual: a 1 TB cap keeps both ==
+status: disk=18289807 B cap=1 TB over=false … last=SimpleBackupsCapOff_2026-11-21_09-11-05.zip …
+counterfactual: a 1 TB cap keeps both backups
+list: SimpleBackupsCapOff_2026-11-21_09-10-54.zip (7.7 MB) SimpleBackupsCapOff_2026-11-21_09-11-05.zip (9.7 MB) …
+PASS: …
+EXIT:0
+```
+
+Evidence: `../_shared/evidence/simplebackups-e2e/e2e-launcher.log` (`PASS` + `EXIT:0`),
+`…-control.log` (`EXIT:1`, the unmodded game makes no backup), `…-selftest.log` (`EXIT:1`),
+`check-e2e-logs.py simplebackups-e2e --strict` → `logs=3 ok=3`.
+
+The run was made from this tree; the only later edit to the package is the `README.md` sentence that
+documents the new key, so the compiled `src/*.rs` and the manifest the game built are byte-identical
+to the delivered package (`build-record.txt` compares them).
+
+### Package 0.2.2
+
+| | |
+|---|---|
+| version | **0.2.2** (`horizon-mod.toml` + `Cargo.toml`) |
+| bytes | **38,169 B** |
+| sha256 | `2edec94439b83c8d030786f737a27e9edfee2649996a81b8dd28bacc96bf8661` |
+| entries | **10** — `horizon-mod.toml`, `Cargo.toml`, `LICENSE`, `LICENSE-NOTICE.md`, `README.md`, `src/{lib,runtime,support,zip}.rs`, `uses.json`; **no `Cargo.lock`** |
+| reproducible | second build after `rm -f Cargo.lock`: `cmp` identical, same sha |
+| `check` | `simplebackups 0.2.2 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, exit 0 |
+| `fits --build 0a875da…` | `0a875da  made for` (the pin tautology, kept as the pin line) |
+| `fits --build 0b14f8a…` | `0b14f8a  fits` — the real gate, exit 0 |
+| tests | **36 passed, 0 failed** — 25 `runtime`, 4 `support`, 7 `zip` |
+
+`fits` is run with the full 40-hex commit: a short name makes the tool list the GitHub releases
+(unauthenticated, `403` in this window), while a full commit resolves from `.horizon/cache`.
+
+### Coverage (family → state)
+
+The family column is prose on purpose: this package carries no content, so
+`check-coverage.py simplebackups` has no ids to inventory (`entries=0`) and reports
+`missing_families=0`; the rows below are the jar's behaviour families, and each `tested` row names the
+phase that asserts it.
+
+| Family | Status | Evidence |
+|---|---|---|
+| scheduled backup (tick or wall clock) | tested | scenario A: `interval_ticks=40` → a zip; scenario B: `enabled=false` → none in 100 ticks |
+| save before copy | tested | every scenario: `LevelRef::request_save` → `world_saved` → the copy starts (`status` `saves=` grows) |
+| zip of the world folder | tested | scenario A/B/D: `zipfile.testzip()` CRC pass, `level.dat` inside, no `session.lock`, no `backups/` subtree |
+| retention (`keep`) | tested | scenario A: `keep=1` leaves exactly one archive |
+| disk cap (`max_disk_size`) | tested | scenario D: `1 B` leaves the newer archive and `over=true`; `1 TB` counterfactual leaves both and `over=false` |
+| commands `backup` / `status` / `list` | tested | `ctl chat "/simplebackups backup"` and `status` in every scenario, `list` in scenario D: the reply names every archive in the folder, and after a `1 B` cap it no longer names the deleted one |
+| save-overlap retry (`retry_on_save`) | tested | unit test `should_retry`; the e2e prints `SKIP` for the overlap (a single-player world cannot produce a second world save — recorded gap) |
+| `pause` / `unpause` | not ported | gap (commands are `backup`, `status`, `list` only) |
+| empty-server policy (`noPlayerBackups`) | not ported | gap; needs a player-presence API and a way to empty the server headless |
+| `latest.log` → `backup.log` | not ported | gap (needs a path outside the world folder) |
+| disk reservation before a copy | not ported | gap (upstream's `NotEnoughDiskSpaceException`) |
+| partial / chains / merge, regex ignores, persisted schedule | not ported | gaps: the pin has no game-time API for tick persistence, and a regex needs a crate |
 
 ## Verification (re-pin `83ad384f`, 2026-11-06/07)
 
@@ -341,14 +497,14 @@ remote runner. Evidence in `../_shared/evidence/simplebackups/`.
    pinned compressor crate (or ships a `deflate` helper) closes it.
 3. **The 0.1.0 harness logs are gone** (`target/horizon-test.log`, `target/G9-e2e.log` lived in
    `target/`, which the disk-hygiene rule cleans); the transcript quoted in this file is the record.
-4. Still deferred, unchanged: incremental/chains/merge, pause/unpause, `latest.log` capture, a disk
-   cap, the empty-server policy, Cherished Worlds/mc2discord, regex ignores, a persisted schedule,
-   and a synchronous-copy mode.
+4. Still deferred, unchanged: incremental/chains/merge, pause/unpause, `latest.log` capture, the
+   empty-server policy, Cherished Worlds/mc2discord, regex ignores and a persisted schedule
+   (**the disk cap is now done — see *Slice 2 (0.2.2)*, which also adds `max_disk_size`**).
 5. `/simplebackups status` is the only route for a config warning; there is no log file.
 6. `side = "both"`, so the mod is installed on a client too; that is required for single player and
    a LAN host (their integrated server belongs to the client installation).
 
-Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-port
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review
 
 ### Verification (SDK 0.2.0, 2026-11-18)
 
@@ -381,3 +537,14 @@ Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven
 > deflated. The `.hnmod`, the mixin plan, the two modules and the seven per-hook helpers are gone.
 > Built against SDK `0b14f8a` / mixins `e59da90` for 26.3; same feature set and the same gaps, plus
 > no compression. Not yet re-run in game (no launcher here).
+
+### Changelog (0.2.2)
+
+> **0.2.2 — the disk cap.** `config/simplebackups.toml` gains `max_disk_size` (upstream's
+> `maxDiskSize`, default `"25 GB"`, binary units). After a good backup the port removes this world's
+> oldest `<world>_*.zip` archives while the backup folder is over that cap, always keeping the newest
+> one, and `/simplebackups status` reports `disk=<size> cap=<size> over=<bool>`; when one archive is
+> left and still too big the completion message says so. Foreign files in the folder count toward the
+> total but are never deleted. Repinned to Horizon `0a875da` (mixins unchanged), 36 tests, and the
+> new scene is proven in game — a 1 B cap leaves exactly the newer archive, a 1 TB counterfactual
+> leaves both. Package 38,169 B, sha256 `2edec944…`.

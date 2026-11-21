@@ -14,7 +14,7 @@
 //! 4. The worker walks the world folder into `<world>_<UTC>.zip.part` with [`crate::zip`], the
 //!    tick publishes it and prunes, and a copy a save overlapped is thrown away and redone.
 
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -27,8 +27,8 @@ use mod_api::{
 };
 
 use crate::runtime::{
-    Config, backup_file_name, copy_is_stale, due_by_millis, due_by_ticks, entry_name, format_size,
-    parse, prune, should_skip, to_toml,
+    Settings, backup_file_name, cap_removals, copy_is_stale, due_by_millis, due_by_ticks,
+    entry_name, format_size, format_size_setting, parse, prune, should_skip, to_toml,
 };
 use crate::zip::ZipWriter;
 
@@ -40,15 +40,24 @@ const CONFIG_FILE: &str = "simplebackups.toml";
 /// costs another save and another copy, so the cap is small).
 const MAX_RETRIES: u32 = 2;
 
+/// Whether a finished copy that a save overlapped is thrown away and redone: the rule the
+/// `retry_on_save` setting, the stale flag and the retry cap decide together.
+fn should_retry(stale: bool, retry_on_save: bool, retries: u32) -> bool {
+    stale && retry_on_save && retries < MAX_RETRIES
+}
+
 /// How many ticks a requested save may take before the copy starts without it. A save request
 /// that never reports back must not stall the schedule for ever.
 const SAVE_WAIT_TICKS: u64 = 200;
 
 /// A finished copy of the world as a `.zip.part`, not yet published: the server tick that
 /// receives it checks whether a save overlapped it before it renames the part (and prunes).
+#[derive(Debug)]
 struct Copy {
     part: PathBuf,
     final_path: PathBuf,
+    /// The resolved backup folder the part was written in.
+    dir: PathBuf,
     bytes: u64,
 }
 
@@ -56,13 +65,19 @@ struct Report {
     name: String,
     bytes: u64,
     deleted: Vec<String>,
+    /// Archives the disk cap removed from this folder (oldest first).
+    cap_removed: Vec<String>,
+    /// The folder's size after the prune, the cap and the removals.
+    disk_bytes: u64,
+    /// The folder is still over the cap with one archive left (upstream logs an error here).
+    over_cap: bool,
     /// Published even though a save overlapped it (retries exhausted or off).
     stale: bool,
 }
 
 #[derive(Default)]
 struct Core {
-    cfg: Config,
+    cfg: Settings,
     /// The open world's folder, taken at the first running tick of the world.
     world: Option<PathBuf>,
     ticks: u64,
@@ -91,7 +106,11 @@ struct Core {
     closing: bool,
     last_completed: Option<String>,
     last_error: Option<String>,
-    /// Config lines the parser refused, shown by `/simplebackups status`.
+    /// The backup folder's size after the last publish.
+    disk_bytes: u64,
+    /// That folder is over `max_disk_size` and only one archive is left to delete.
+    over_cap: bool,
+    /// Settings lines the parser refused, shown by `/simplebackups status`.
     warnings: Vec<String>,
 }
 
@@ -126,12 +145,12 @@ pub fn load_config(host: &dyn Host) {
     let (cfg, warnings) = match files.read(&path) {
         Ok(bytes) => parse(&String::from_utf8_lossy(&bytes)),
         Err(ConfigFileError::NotFound) => {
-            let cfg = Config::default();
+            let cfg = Settings::default();
             let _ = files.write(&path, to_toml(&cfg).as_bytes());
             (cfg, Vec::new())
         }
         Err(_) => {
-            let cfg = Config::default();
+            let cfg = Settings::default();
             let text = to_toml(&cfg);
             let _ = files.write(&path, text.as_bytes());
             parse(&text)
@@ -212,6 +231,8 @@ fn ensure_world(host: &dyn ServerHost) {
     core.retries = 0;
     core.retrying = false;
     core.stale = false;
+    core.disk_bytes = 0;
+    core.over_cap = false;
 }
 
 /// The server completed a save cycle (`world_saved`): the port's own requested save and every
@@ -300,7 +321,7 @@ pub fn on_server_tick(host: &mut dyn ServerHost, world_running: bool) {
             match result {
                 Ok(copy) => {
                     let stale = copy_is_stale(core.save_seq_at_start, core.save_seq);
-                    if stale && core.cfg.retry_on_save && core.retries < MAX_RETRIES {
+                    if should_retry(stale, core.cfg.retry_on_save, core.retries) {
                         let _ = fs::remove_file(&copy.part);
                         core.retries += 1;
                         core.retrying = true;
@@ -323,6 +344,19 @@ pub fn on_server_tick(host: &mut dyn ServerHost, world_running: bool) {
                             format!("Backup {} ({})", report.name, format_size(report.bytes));
                         if !report.deleted.is_empty() {
                             message.push_str(&format!("; pruned {}", report.deleted.len()));
+                        }
+                        if !report.cap_removed.is_empty() {
+                            message.push_str(&format!(
+                                "; removed {} over the disk cap",
+                                report.cap_removed.len()
+                            ));
+                        }
+                        if report.over_cap {
+                            message.push_str(&format!(
+                                "; still over the disk cap ({} of {})",
+                                format_size_setting(report.disk_bytes),
+                                format_size_setting(core.cfg.max_disk_bytes)
+                            ));
                         }
                         if report.stale {
                             message.push_str("; a save overlapped this copy");
@@ -438,7 +472,7 @@ fn start_backup(host: &mut dyn ServerHost, quiet: bool) {
 
 /// Start the worker for the in-flight request: name the file, spawn the copy, tell the players.
 fn begin_copy(host: &mut dyn ServerHost, quiet: bool) {
-    let (cfg, world, name, final_path) = {
+    let (cfg, world, name, final_path, backups_prefix) = {
         let mut guard = core();
         let Some(core) = guard.as_mut() else {
             return;
@@ -448,12 +482,17 @@ fn begin_copy(host: &mut dyn ServerHost, quiet: bool) {
             core.last_error = Some("no world open".to_owned());
             return;
         };
-        let backup_dir = world.join(core.cfg.backups_dir());
-        if let Err(error) = fs::create_dir_all(&backup_dir) {
-            core.in_flight = false;
-            core.last_error = Some(error.to_string());
-            return;
-        }
+        let backup_dir = match owned_dir(&world, core.cfg.backups_dir()) {
+            Ok(dir) => dir,
+            Err(error) => {
+                core.in_flight = false;
+                core.last_error = Some(error);
+                return;
+            }
+        };
+        let backups_prefix = fs::canonicalize(&world)
+            .ok()
+            .and_then(|root| prefix_of(&root, &backup_dir));
         let world_name = world_name(&world);
         let taken: Vec<String> = fs::read_dir(&backup_dir)
             .map(|entries| {
@@ -468,14 +507,14 @@ fn begin_copy(host: &mut dyn ServerHost, quiet: bool) {
         core.in_flight = true;
         core.in_flight_quiet = quiet;
         core.save_seq_at_start = core.save_seq;
-        (core.cfg.clone(), world, name, final_path)
+        (core.cfg.clone(), world, name, final_path, backups_prefix)
     };
 
     let (tx, rx) = mpsc::channel();
     let worker_cfg = cfg.clone();
     let worker_final = final_path.clone();
     thread::spawn(move || {
-        let result = run_backup(&world, &worker_final, &worker_cfg);
+        let result = run_backup(&world, &worker_final, &worker_cfg, backups_prefix);
         let _ = tx.send(result);
     });
     {
@@ -493,11 +532,33 @@ fn begin_copy(host: &mut dyn ServerHost, quiet: bool) {
 
 /// Walk the world into `<final>.part` and return it unpublished; the server tick renames it only
 /// when no save overlapped the copy.
-fn run_backup(world: &Path, final_path: &Path, cfg: &Config) -> Result<Copy, String> {
+fn run_backup(
+    world: &Path,
+    final_path: &Path,
+    cfg: &Settings,
+    backups_prefix: Option<String>,
+) -> Result<Copy, String> {
     let world_name = world_name(world);
     let part = final_path.with_extension("zip.part");
     let result = (|| -> Result<u64, String> {
-        let file = File::create(&part).map_err(|error| error.to_string())?;
+        // Reserve a **new** staging file. `File::create` follows a pre-existing
+        // `.zip.part` (a stale file, or a symlink someone planted) and truncates
+        // whatever it points at; removing the entry first removes a link itself, not
+        // its target, and `create_new` then refuses a path that reappeared.
+        match fs::symlink_metadata(&part) {
+            Ok(meta) if meta.is_file() || meta.file_type().is_symlink() => {
+                fs::remove_file(&part).map_err(|error| error.to_string())?;
+            }
+            Ok(_) => {
+                return Err(format!("staging path {} is not a file", part.display()));
+            }
+            Err(_) => {}
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+            .map_err(|error| error.to_string())?;
         let mut zip = ZipWriter::new(BufWriter::new(file));
         walk(
             &mut zip,
@@ -505,7 +566,7 @@ fn run_backup(world: &Path, final_path: &Path, cfg: &Config) -> Result<Copy, Str
             "",
             &world_name,
             cfg,
-            Some(cfg.backups_dir()),
+            backups_prefix.as_deref(),
         )?;
         let writer = zip.finish().map_err(|error| error.to_string())?;
         let file = writer
@@ -524,6 +585,9 @@ fn run_backup(world: &Path, final_path: &Path, cfg: &Config) -> Result<Copy, Str
     Ok(Copy {
         part,
         final_path: final_path.to_owned(),
+        dir: final_path
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
         bytes,
     })
 }
@@ -535,7 +599,7 @@ fn publish(core: &mut Core, copy: &Copy, stale: bool) -> Result<Report, String> 
         return Err("no world open".to_owned());
     };
     let world_name = world_name(&world);
-    let backups = world.join(core.cfg.backups_dir());
+    let backups = copy.dir.clone();
     fs::rename(&copy.part, &copy.final_path).map_err(|error| {
         let _ = fs::remove_file(&copy.part);
         error.to_string()
@@ -552,6 +616,12 @@ fn publish(core: &mut Core, copy: &Copy, stale: bool) -> Result<Report, String> 
     for name in &deleted {
         let _ = fs::remove_file(backups.join(name));
     }
+    // Upstream enforces `maxDiskSize` after a good backup (`BackupThread.java:154-178`): the
+    // oldest archives go while the folder is over the cap, and the last one always stays.
+    let (cap_removed, disk_bytes, over_cap) =
+        enforce_cap(&backups, &world_name, core.cfg.max_disk_bytes);
+    core.disk_bytes = disk_bytes;
+    core.over_cap = over_cap;
     if stale {
         core.stale = true;
     }
@@ -563,8 +633,70 @@ fn publish(core: &mut Core, copy: &Copy, stale: bool) -> Result<Report, String> 
             .unwrap_or_default(),
         bytes: copy.bytes,
         deleted,
+        cap_removed,
+        disk_bytes,
+        over_cap,
         stale,
     })
+}
+
+/// The folder's regular files as `(name, bytes)`. A folder and a symlink are not counted: the cap is
+/// about bytes this folder holds, and following a link would charge the port for someone else's file.
+fn folder_files(dir: &Path) -> Vec<(String, u64)> {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let meta = fs::symlink_metadata(entry.path()).ok()?;
+                    meta.is_file()
+                        .then(|| (entry.file_name().to_string_lossy().into_owned(), meta.len()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Delete this world's oldest archives while the backup folder is over `cap`, never the last one.
+/// Returns what was removed, the folder size left, and whether it is still over the cap.
+fn enforce_cap(dir: &Path, world: &str, cap: u64) -> (Vec<String>, u64, bool) {
+    let plan = cap_removals(&folder_files(dir), world, cap);
+    let mut removed = Vec::new();
+    for name in &plan.remove {
+        if fs::remove_file(dir.join(name)).is_ok() {
+            removed.push(name.clone());
+        }
+    }
+    let remaining: u64 = folder_files(dir).iter().map(|(_, bytes)| *bytes).sum();
+    (removed, remaining, remaining > cap)
+}
+
+/// The backup folder, created if needed and verified to resolve **inside** the world.
+/// `Settings::backups_dir` has already refused an absolute path and a parent component;
+/// this checks what the filesystem actually resolves, because an existing symlink (or
+/// junction) at the joined path can still point outside the world, and the worker
+/// writes and prunes there.
+fn owned_dir(world: &Path, relative: &str) -> Result<PathBuf, String> {
+    let root = fs::canonicalize(world).map_err(|error| format!("world folder: {error}"))?;
+    let dir = world.join(relative);
+    fs::create_dir_all(&dir).map_err(|error| format!("backups folder: {error}"))?;
+    let resolved = fs::canonicalize(&dir).map_err(|error| format!("backups folder: {error}"))?;
+    if !resolved.starts_with(&root) {
+        return Err(format!(
+            "backups folder {} resolves outside the world {}",
+            resolved.display(),
+            root.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+/// The resolved folder's path relative to the world, in the walk's `/` spelling:
+/// the subtree the copy must leave out, whatever spelling the config used.
+fn prefix_of(root: &Path, dir: &Path) -> Option<String> {
+    dir.strip_prefix(root)
+        .ok()
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
 }
 
 /// The world folder's own name, which prefix every entry and every backup file name.
@@ -582,7 +714,7 @@ fn walk<W: io::Write + io::Seek>(
     dir: &Path,
     prefix: &str,
     world_name: &str,
-    cfg: &Config,
+    cfg: &Settings,
     backups_prefix: Option<&str>,
 ) -> Result<(), String> {
     let mut entries: Vec<_> = fs::read_dir(dir)
@@ -686,11 +818,11 @@ fn status_lines() -> Vec<String> {
         core.cfg.save_before_backup
     )];
     if let Some(world) = &core.world {
-        lines.push(format!(
-            "world={} backups={}",
-            world.display(),
-            world.join(core.cfg.backups_dir()).display()
-        ));
+        let backups = owned_dir(world, core.cfg.backups_dir()).map_or_else(
+            |error| format!("<refused: {error}>"),
+            |dir| dir.display().to_string(),
+        );
+        lines.push(format!("world={} backups={backups}", world.display()));
     }
     lines.push(format!(
         "in_flight={} last={} error={}",
@@ -701,6 +833,14 @@ fn status_lines() -> Vec<String> {
     lines.push(format!(
         "saves={} retries={} stale={}",
         core.save_seq, core.retries, core.stale
+    ));
+    // The disk cap is a config key of its own, so it gets a line of its own: the folder's size after
+    // the last publish, the cap it is measured against, and whether it is still over it.
+    lines.push(format!(
+        "disk={} cap={} over={}",
+        format_size_setting(core.disk_bytes),
+        format_size_setting(core.cfg.max_disk_bytes),
+        core.over_cap
     ));
     // The 0.1.0 bundle logged config warnings; a native mod has no logger, so this is where they
     // reach a player. The four lines above are byte-identical to 0.1.0.
@@ -718,7 +858,10 @@ fn list_lines() -> Vec<String> {
     let Some(world) = &core.world else {
         return vec!["No world is open.".to_owned()];
     };
-    let dir = world.join(core.cfg.backups_dir());
+    let dir = match owned_dir(world, core.cfg.backups_dir()) {
+        Ok(dir) => dir,
+        Err(error) => return vec![format!("Simple Backups: {error}")],
+    };
     let mut names: Vec<String> = fs::read_dir(&dir)
         .map(|entries| {
             entries
@@ -742,4 +885,128 @@ fn list_lines() -> Vec<String> {
             format!("{name} ({size})")
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A throw-away world folder with one file in it.
+    fn scratch_world(tag: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let root = std::env::temp_dir().join(format!(
+            "simplebackups-test-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        let world = root.join("World");
+        fs::create_dir_all(&world).expect("scratch world");
+        fs::write(world.join("level.dat"), b"a world").expect("level.dat");
+        world
+    }
+
+    fn cleanup(world: &Path) {
+        if let Some(root) = world.parent() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn an_overlapped_copy_is_redone_only_within_the_rule() {
+        assert!(should_retry(true, true, 0));
+        assert!(should_retry(true, true, MAX_RETRIES - 1));
+        assert!(
+            !should_retry(false, true, 0),
+            "a clean copy is published as it is"
+        );
+        assert!(
+            !should_retry(true, false, 0),
+            "retry_on_save=false keeps the stale copy"
+        );
+        assert!(
+            !should_retry(true, true, MAX_RETRIES),
+            "the cap stops the save/copy loop"
+        );
+    }
+
+    #[test]
+    fn a_planted_staging_symlink_is_not_followed_or_truncated() {
+        let world = scratch_world("stage");
+        let outside = world.parent().expect("a parent").join("outside.txt");
+        fs::write(&outside, b"keep me").expect("outside file");
+        let backups = world.join("backups");
+        fs::create_dir_all(&backups).expect("backups folder");
+        let final_path = backups.join("W_2026-01-01_00-00-00.zip");
+        let part = final_path.with_extension("zip.part");
+        symlink(&outside, &part).expect("planted symlink");
+
+        let result = run_backup(
+            &world,
+            &final_path,
+            &Settings::default(),
+            Some("backups".to_owned()),
+        );
+
+        assert!(
+            result.is_ok(),
+            "the copy should succeed past a planted link: {result:?}"
+        );
+        assert_eq!(
+            fs::read(&outside).expect("outside still readable"),
+            b"keep me",
+            "the link target must not be truncated"
+        );
+        let meta = fs::symlink_metadata(&part).expect("the part file");
+        assert!(meta.is_file(), "the staging file must be a regular file");
+        assert!(
+            meta.len() > 0,
+            "the staging file holds the copy, not the old link target"
+        );
+        cleanup(&world);
+    }
+
+    #[test]
+    fn a_backups_folder_that_resolves_outside_the_world_is_refused() {
+        let world = scratch_world("escape");
+        let outside = world.parent().expect("a parent").join("elsewhere");
+        fs::create_dir_all(&outside).expect("outside folder");
+        symlink(&outside, world.join("backups")).expect("planted folder link");
+
+        let refused = owned_dir(&world, "backups");
+        assert!(
+            refused.is_err(),
+            "a backups folder that resolves outside the world must be refused, got {refused:?}"
+        );
+        cleanup(&world);
+    }
+
+    #[test]
+    fn the_disk_cap_removes_the_oldest_archive_and_keeps_foreign_files() {
+        let world = scratch_world("cap");
+        let backups = world.join("backups");
+        fs::create_dir_all(&backups).expect("backups folder");
+        let older = backups.join("World_2026-01-01_00-00-00.zip");
+        let newer = backups.join("World_2026-01-01_00-00-01.zip");
+        fs::write(&older, vec![0u8; 400]).expect("older archive");
+        fs::write(&newer, vec![0u8; 400]).expect("newer archive");
+        let foreign = backups.join("someone-elses-map.zip");
+        fs::write(&foreign, vec![0u8; 5_000]).expect("foreign archive");
+
+        let (removed, remaining, over) = enforce_cap(&backups, "World", 1_000);
+
+        assert_eq!(
+            removed,
+            ["World_2026-01-01_00-00-00.zip"],
+            "only the oldest of our archives is removed"
+        );
+        assert_eq!(remaining, 5_400, "the folder still holds the foreign file");
+        assert!(over, "one archive plus a foreign file is over 1 KB");
+        assert!(!older.exists(), "the oldest archive is gone");
+        assert!(newer.exists(), "the newest archive stays");
+        assert!(foreign.exists(), "nothing foreign is deleted");
+        cleanup(&world);
+    }
 }

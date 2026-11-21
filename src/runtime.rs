@@ -10,7 +10,7 @@
 
 /// Upstream-compatible configuration (`config/simplebackups.toml`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Config {
+pub struct Settings {
     pub enabled: bool,
     pub interval_minutes: u64,
     pub interval_ticks: u64,
@@ -21,13 +21,15 @@ pub struct Config {
     pub retry_on_save: bool,
     pub broadcast: bool,
     pub backups_dir: String,
+    /// The whole backup folder may not exceed this many bytes after a good backup.
+    pub max_disk_bytes: u64,
     pub ignored_paths: Vec<String>,
     pub ignored_files: Vec<String>,
 }
 
-impl Default for Config {
+impl Default for Settings {
     fn default() -> Self {
-        Config {
+        Settings {
             enabled: true,
             interval_minutes: 120,
             interval_ticks: 0,
@@ -37,14 +39,17 @@ impl Default for Config {
             retry_on_save: true,
             broadcast: true,
             backups_dir: "backups".to_owned(),
+            max_disk_bytes: DEFAULT_MAX_DISK_BYTES,
             ignored_paths: Vec::new(),
             ignored_files: Vec::new(),
         }
     }
 }
 
-impl Config {
-    /// The backup folder, treating an empty setting as the default.
+impl Settings {
+    /// The backup folder, treating an empty setting as the default. The parser
+    /// normalises it through [`safe_backups_dir`], so it is always a relative path
+    /// with no `.`/`..` component.
     pub fn backups_dir(&self) -> &str {
         if self.backups_dir.trim().is_empty() {
             "backups"
@@ -54,10 +59,36 @@ impl Config {
     }
 }
 
+/// A configured backup folder as a safe **world-relative** path: an absolute path
+/// and a parent component are refused, `.`/empty components are dropped (so
+/// `./backups` and `backups/` are the same folder), and nothing may resolve to the
+/// world itself. The glue additionally verifies the resolved path, because an
+/// existing symlink at that name can still point outside the world.
+#[must_use]
+pub fn safe_backups_dir(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let raw = raw.replace('\\', "/");
+    if raw.starts_with('/') {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in raw.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => return None,
+            other => parts.push(other),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
 /// Parse the simple `key = value` config used by the port. Bad values keep
 /// their defaults and are reported; unknown keys are reported too.
-pub fn parse(input: &str) -> (Config, Vec<String>) {
-    let mut config = Config::default();
+pub fn parse(input: &str) -> (Settings, Vec<String>) {
+    let mut config = Settings::default();
     let mut warnings = Vec::new();
     for raw in input.lines() {
         let line = raw.split('#').next().unwrap_or("").trim();
@@ -111,9 +142,17 @@ pub fn parse(input: &str) -> (Config, Vec<String>) {
                 Some(parsed) => config.broadcast = parsed,
                 None => warnings.push(format!("broadcast: not a boolean: {value}")),
             },
-            "backups_dir" => match strip_quotes(value) {
-                Some(parsed) => config.backups_dir = parsed.to_owned(),
-                None => warnings.push(format!("backups_dir: not a string: {value}")),
+            "backups_dir" => match strip_quotes(value).and_then(safe_backups_dir) {
+                Some(parsed) => config.backups_dir = parsed,
+                None => warnings.push(format!(
+                    "backups_dir: not a safe world-relative path: {value}"
+                )),
+            },
+            "max_disk_size" => match parse_size(value) {
+                Some(parsed) => config.max_disk_bytes = parsed,
+                None => warnings.push(format!(
+                    "max_disk_size: not a size such as \"25 GB\": {value}"
+                )),
             },
             "ignored_paths" => match parse_array(value) {
                 Some(parsed) => config.ignored_paths = parsed,
@@ -160,7 +199,7 @@ fn parse_array(value: &str) -> Option<Vec<String>> {
 }
 
 /// The default file written when no config exists.
-pub fn to_toml(config: &Config) -> String {
+pub fn to_toml(config: &Settings) -> String {
     let mut out = String::new();
     out.push_str("# Simple Backups — world backups (Apache-2.0 port)\n");
     out.push_str(&format!("enabled = {}\n", config.enabled));
@@ -178,6 +217,10 @@ pub fn to_toml(config: &Config) -> String {
     out.push_str(&format!("retry_on_save = {}\n", config.retry_on_save));
     out.push_str(&format!("broadcast = {}\n", config.broadcast));
     out.push_str(&format!("backups_dir = \"{}\"\n", config.backups_dir()));
+    out.push_str(&format!(
+        "max_disk_size = \"{}\"\n",
+        format_size_setting(config.max_disk_bytes)
+    ));
     out
 }
 
@@ -275,7 +318,7 @@ pub fn entry_name(world: &str, relative: &str) -> Option<String> {
 }
 
 /// Whether a world-relative path is left out of the zip.
-pub fn should_skip(relative: &str, backups_prefix: Option<&str>, config: &Config) -> bool {
+pub fn should_skip(relative: &str, backups_prefix: Option<&str>, config: &Settings) -> bool {
     let Some(relative) = normalise(relative) else {
         return true;
     };
@@ -283,17 +326,17 @@ pub fn should_skip(relative: &str, backups_prefix: Option<&str>, config: &Config
     if name == "session.lock" || name.ends_with(".part") || name.ends_with(".tmp") {
         return true;
     }
-    if let Some(prefix) = backups_prefix {
-        let prefix = prefix.trim_matches('/');
-        if !prefix.is_empty() && (relative == prefix || relative.starts_with(&format!("{prefix}/")))
-        {
+    if let Some(prefix) = backups_prefix.and_then(normalise) {
+        // Normalise the configured prefix exactly as the visited path was
+        // normalised: `./backups` names the same folder as `backups`, and comparing
+        // the raw spelling would put old archives inside the new ones.
+        if relative == prefix || relative.starts_with(&format!("{prefix}/")) {
             return true;
         }
     }
     if config.ignored_paths.iter().any(|prefix| {
-        let prefix = prefix.replace('\\', "/");
-        let prefix = prefix.trim_matches('/');
-        !prefix.is_empty() && (relative == prefix || relative.starts_with(&format!("{prefix}/")))
+        normalise(prefix)
+            .is_some_and(|prefix| relative == prefix || relative.starts_with(&format!("{prefix}/")))
     }) {
         return true;
     }
@@ -319,13 +362,104 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Upstream's `maxDiskSize` default: `"25 GB"`, binary units (`CommonConfig.java:80-83`).
+pub const DEFAULT_MAX_DISK_BYTES: u64 = 25 * 1024 * 1024 * 1024;
+
+/// The size units the config accepts, largest first, all binary (`StorageSize.java:32-37`).
+const SIZE_UNITS: [(&str, u64); 5] = [
+    ("TB", 1024 * 1024 * 1024 * 1024),
+    ("GB", 1024 * 1024 * 1024),
+    ("MB", 1024 * 1024),
+    ("KB", 1024),
+    ("B", 1),
+];
+
+/// Parse an upstream-style size: a whole number and an optional binary unit
+/// (`B`, `KB`, `MB`, `GB`, `TB`), case-insensitively. A bare number is bytes.
+#[must_use]
+pub fn parse_size(input: &str) -> Option<u64> {
+    let text = input.trim();
+    let text = text
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(text)
+        .trim();
+    if text.is_empty() {
+        return None;
+    }
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    if number.is_empty() {
+        return None;
+    }
+    let number: u64 = number.parse().ok()?;
+    let unit = unit.trim().to_ascii_uppercase();
+    let (_, multiplier) = SIZE_UNITS.iter().find(|(name, _)| {
+        if unit.is_empty() {
+            *name == "B"
+        } else {
+            *name == unit
+        }
+    })?;
+    number.checked_mul(*multiplier)
+}
+
+/// A byte count in the config's own spelling, in the largest unit that divides it exactly.
+#[must_use]
+pub fn format_size_setting(bytes: u64) -> String {
+    for (name, size) in SIZE_UNITS {
+        if bytes >= size && bytes.is_multiple_of(size) {
+            return format!("{} {name}", bytes / size);
+        }
+    }
+    format!("{bytes} B")
+}
+
+/// What the disk cap does to a folder: the archives to delete (oldest first) and the size left.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CapPlan {
+    pub remove: Vec<String>,
+    pub remaining_bytes: u64,
+    pub over: bool,
+}
+
+/// Plan the archives the cap removes: the whole folder counts toward the cap, only this world's
+/// `<world>_*.zip` files are ever deleted, oldest first, and never the last one standing.
+#[must_use]
+pub fn cap_removals(entries: &[(String, u64)], world: &str, cap: u64) -> CapPlan {
+    let mut remaining_bytes: u64 = entries.iter().map(|(_, size)| *size).sum();
+    let prefix = format!("{world}_");
+    let mut candidates: Vec<(&str, u64)> = entries
+        .iter()
+        .filter(|(name, _)| name.starts_with(&prefix) && name.ends_with(".zip"))
+        .map(|(name, size)| (name.as_str(), *size))
+        .collect();
+    // The names are UTC timestamps, so lexical order is chronological order.
+    candidates.sort_by(|a, b| a.0.cmp(b.0));
+    let mut remove = Vec::new();
+    let mut index = 0;
+    while remaining_bytes > cap && candidates.len().saturating_sub(index) > 1 {
+        let (name, size) = candidates[index];
+        remove.push(name.to_owned());
+        remaining_bytes -= size;
+        index += 1;
+    }
+    CapPlan {
+        remove,
+        remaining_bytes,
+        over: remaining_bytes > cap,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn defaults_match_upstream() {
-        let config = Config::default();
+        let config = Settings::default();
         assert!(config.enabled);
         assert_eq!(config.interval_minutes, 120);
         assert_eq!(config.keep, 10);
@@ -464,7 +598,7 @@ mod tests {
 
     #[test]
     fn skip_rules_cover_locks_temp_and_the_backups_folder() {
-        let config = Config::default();
+        let config = Settings::default();
         assert!(should_skip("session.lock", Some("backups"), &config));
         assert!(should_skip(
             "region/r.0.0.mca.part",
@@ -480,6 +614,45 @@ mod tests {
         assert!(should_skip("backups", Some("backups"), &config));
         assert!(!should_skip("region/r.0.0.mca", Some("backups"), &config));
         assert!(!should_skip("level.dat", Some("backups"), &config));
+    }
+
+    #[test]
+    fn a_backup_folder_may_not_leave_the_world() {
+        assert_eq!(safe_backups_dir("backups").as_deref(), Some("backups"));
+        assert_eq!(safe_backups_dir("./backups").as_deref(), Some("backups"));
+        assert_eq!(safe_backups_dir("backups/").as_deref(), Some("backups"));
+        assert_eq!(
+            safe_backups_dir("backups/worlds").as_deref(),
+            Some("backups/worlds")
+        );
+        assert_eq!(safe_backups_dir("../outside"), None);
+        assert_eq!(safe_backups_dir("backups/../../etc"), None);
+        assert_eq!(safe_backups_dir("/etc/simplebackups"), None);
+        assert_eq!(
+            safe_backups_dir("."),
+            None,
+            "the world itself is not a backup folder"
+        );
+        assert_eq!(safe_backups_dir("   "), None);
+    }
+
+    #[test]
+    fn an_unsafe_backups_dir_is_refused_and_the_default_kept() {
+        let (config, warnings) = parse("backups_dir = \"../outside\"\n");
+        assert_eq!(config.backups_dir(), "backups");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let (config, warnings) = parse("backups_dir = \"/srv/backups\"\n");
+        assert_eq!(config.backups_dir(), "backups");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    #[test]
+    fn a_dot_spelled_output_folder_is_still_excluded_from_the_zip() {
+        let config = Settings::default();
+        // The walk normalises the visited path; the configured prefix must be
+        // normalised the same way or the archives are copied into the next archive.
+        assert!(should_skip("backups/W_1.zip", Some("./backups"), &config));
+        assert!(!should_skip("region/r.0.0.mca", Some("./backups"), &config));
     }
 
     #[test]
@@ -506,8 +679,105 @@ mod tests {
     }
 
     #[test]
+    fn the_disk_cap_defaults_to_upstreams_25_gb() {
+        let config = Settings::default();
+        assert_eq!(
+            config.max_disk_bytes, 26_843_545_600,
+            "upstream's maxDiskSize default is 25 GB in binary units"
+        );
+        let written = to_toml(&config);
+        assert!(
+            written.contains("max_disk_size = \"25 GB\""),
+            "the default file must carry the cap: {written}"
+        );
+    }
+
+    #[test]
+    fn sizes_are_parsed_with_binary_units() {
+        assert_eq!(parse_size("25 GB"), Some(26_843_545_600));
+        assert_eq!(parse_size("512 B"), Some(512));
+        assert_eq!(parse_size("512"), Some(512), "a bare number is bytes");
+        assert_eq!(parse_size("1 KB"), Some(1_024));
+        assert_eq!(parse_size("2 MB"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_size("1 TB"), Some(1024 * 1024 * 1024 * 1024));
+        assert_eq!(
+            parse_size(" 25 gb "),
+            Some(26_843_545_600),
+            "spacing and case do not matter"
+        );
+        assert_eq!(
+            parse_size("1.5 GB"),
+            None,
+            "upstream sizes are whole numbers"
+        );
+        assert_eq!(parse_size("25 GB extra"), None);
+        assert_eq!(parse_size("GB"), None);
+        assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("-1 KB"), None);
+        assert_eq!(
+            parse_size("99999999999 TB"),
+            None,
+            "a size that cannot be a u64 is refused, not wrapped"
+        );
+    }
+
+    #[test]
+    fn sizes_render_in_the_largest_exact_unit() {
+        assert_eq!(format_size_setting(26_843_545_600), "25 GB");
+        assert_eq!(format_size_setting(1024), "1 KB");
+        assert_eq!(format_size_setting(512), "512 B");
+        assert_eq!(
+            format_size_setting(1_536),
+            "1536 B",
+            "only a unit that divides the count exactly is used"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_disk_cap_keeps_the_default_and_warns() {
+        let (config, warnings) = parse("max_disk_size = \"a lot\"\n");
+        assert_eq!(config.max_disk_bytes, DEFAULT_MAX_DISK_BYTES);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let (config, warnings) = parse("max_disk_size = \"1 KB\"\n");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.max_disk_bytes, 1_024);
+    }
+
+    #[test]
+    fn the_cap_removes_the_oldest_archives_first_but_never_the_last() {
+        let entries = vec![
+            ("W_1.zip".to_owned(), 600),
+            ("W_2.zip".to_owned(), 600),
+            ("W_3.zip".to_owned(), 600),
+        ];
+        let plan = cap_removals(&entries, "W", 500);
+        assert_eq!(plan.remove, ["W_1.zip", "W_2.zip"]);
+        assert_eq!(plan.remaining_bytes, 600, "the newest archive stays");
+        assert!(plan.over, "one archive is still bigger than the cap");
+        let plan = cap_removals(&entries, "W", 2_000);
+        assert!(plan.remove.is_empty());
+        assert_eq!(plan.remaining_bytes, 1_800);
+        assert!(!plan.over);
+    }
+
+    #[test]
+    fn the_cap_counts_the_folder_but_only_deletes_our_archives() {
+        let entries = vec![
+            ("W_1.zip".to_owned(), 400),
+            ("W_2.zip".to_owned(), 400),
+            ("Other_1.zip".to_owned(), 400),
+            ("someone-elses-map.zip".to_owned(), 5_000),
+            ("notes.txt".to_owned(), 100),
+        ];
+        let plan = cap_removals(&entries, "W", 1_000);
+        assert_eq!(plan.remove, ["W_1.zip"], "nothing foreign is deleted");
+        assert_eq!(plan.remaining_bytes, 5_900);
+        assert!(plan.over);
+    }
+
+    #[test]
     fn the_default_file_round_trips() {
-        let config = Config::default();
+        let config = Settings::default();
         let (parsed, warnings) = parse(&to_toml(&config));
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(parsed, config);

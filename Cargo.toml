@@ -2,14 +2,14 @@
 # Port of Simple Backups 1.21-4.0.30 (ChaoticTrials/SimpleBackups, Apache-2.0) for
 # Minecraft Java 1.21.1 NeoForge; the port targets Horizon 26.3 at the pin in
 # horizon-mod.toml. Clean-room Rust rewrite from the mod's behaviour (notes.md);
-# local-only until publishing is approved, and the outbound licence needs the
-# maintainer's review (LICENSE-NOTICE.md).
+# local-only until publishing is approved. The outbound licence is Apache-2.0,
+# the same as upstream (LICENSE-NOTICE.md).
 #
 # Cargo's name and version are not the mod's identity: horizon-mod.toml is.
 name = "simplebackups"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 description = "Simple Backups for Horizon: scheduled world backups with retention"
 publish = false
 

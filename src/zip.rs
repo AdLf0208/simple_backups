@@ -30,6 +30,11 @@ const ZIP64_EXTRA: u16 = 0x0001;
 const FLAG_UTF8: u16 = 0x0800;
 /// Stored: no compression.
 const METHOD_STORED: u16 = 0;
+/// The entry's CRC and sizes follow the data instead of the local header (bit 3), which is
+/// what makes a one-pass copy of a file that is still being written sound.
+const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
+/// The data descriptor's signature.
+const DATA_DESCRIPTOR: u32 = 0x0807_4b50;
 /// 1980-01-01, the DOS epoch: the oldest date a ZIP field can carry.
 const DOS_DATE_1980: u16 = 0x0021;
 /// The largest size or offset a 32-bit field holds.
@@ -73,43 +78,49 @@ impl<W: Write + Seek> ZipWriter<W> {
 
     /// Add the file at `path` as the stored entry `name`.
     ///
-    /// The file is read twice: once to learn its length and CRC-32, which the local header
-    /// carries, and once to copy it. A file that disappears between the passes is an error, so
-    /// the caller discards the part file, as a mid-copy failure always did.
+    /// The file is copied in **one** pass and its CRC and sizes travel in a data descriptor
+    /// after it (flag bit 3), so a file that changes between a checksum pass and a copy pass
+    /// cannot put a wrong CRC in the header: the archive always matches the bytes it holds.
+    /// (0.2.0 read the file twice and a save or a chunk write in between produced an entry
+    /// whose CRC failed on read-back.)
     ///
     /// # Errors
     ///
     /// The file could not be read, or the writer failed.
     pub fn add_file(&mut self, name: &str, path: &Path) -> io::Result<()> {
-        let (crc, bytes) = checksum(path)?;
         let name_len = u16::try_from(name.len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "the entry name is too long")
         })?;
-        let zip64 = self.force_zip64 || bytes >= MAX_32 || self.offset >= MAX_32;
-
+        let force = self.force_zip64;
         let local_offset = self.offset;
-        let mut header = Vec::with_capacity(30 + name.len() + 20);
+        let mut header = Vec::with_capacity(30 + name.len());
         put_u32(&mut header, LOCAL_HEADER);
-        put_u16(&mut header, if zip64 { 45 } else { 20 });
-        put_u16(&mut header, FLAG_UTF8);
+        put_u16(&mut header, if force { 45 } else { 20 });
+        put_u16(&mut header, FLAG_UTF8 | FLAG_DATA_DESCRIPTOR);
         put_u16(&mut header, METHOD_STORED);
         put_u16(&mut header, 0);
         put_u16(&mut header, DOS_DATE_1980);
-        put_u32(&mut header, crc);
-        let placeholder = if zip64 { MAX_32 as u32 } else { bytes as u32 };
+        put_u32(&mut header, 0);
+        let placeholder = if force { MAX_32 as u32 } else { 0 };
         put_u32(&mut header, placeholder);
         put_u32(&mut header, placeholder);
         put_u16(&mut header, name_len);
-        put_u16(&mut header, if zip64 { 20 } else { 0 });
+        put_u16(&mut header, 0);
         header.extend_from_slice(name.as_bytes());
-        if zip64 {
-            put_u16(&mut header, ZIP64_EXTRA);
-            put_u16(&mut header, 16);
-            put_u64(&mut header, bytes);
-            put_u64(&mut header, bytes);
-        }
         self.write(&header)?;
-        self.copy_exact(path, bytes)?;
+        let (crc, bytes) = self.copy_computing(path)?;
+        let zip64 = force || bytes >= MAX_32;
+        let mut descriptor = Vec::with_capacity(24);
+        put_u32(&mut descriptor, DATA_DESCRIPTOR);
+        put_u32(&mut descriptor, crc);
+        if zip64 {
+            put_u64(&mut descriptor, bytes);
+            put_u64(&mut descriptor, bytes);
+        } else {
+            put_u32(&mut descriptor, bytes as u32);
+            put_u32(&mut descriptor, bytes as u32);
+        }
+        self.write(&descriptor)?;
 
         self.entries.push(Entry {
             name: name.to_owned(),
@@ -237,43 +248,25 @@ impl<W: Write + Seek> ZipWriter<W> {
         Ok(())
     }
 
-    /// Copy exactly `bytes` bytes of `path` after the writer, refusing a file that shrank.
-    fn copy_exact(&mut self, path: &Path, bytes: u64) -> io::Result<()> {
+    /// Copy `path` after the writer in one pass, returning its CRC-32 and length. A file that
+    /// grows is copied to its end; one that shrinks cannot make the header lie, because the
+    /// header carries no size.
+    fn copy_computing(&mut self, path: &Path) -> io::Result<(u32, u64)> {
         let mut source = File::open(path)?;
         let mut buffer = [0u8; 64 * 1024];
-        let mut copied = 0u64;
-        while copied < bytes {
-            let want =
-                usize::try_from((bytes - copied).min(buffer.len() as u64)).unwrap_or(buffer.len());
-            let read = source.read(&mut buffer[..want])?;
+        let mut crc = 0xFFFF_FFFFu32;
+        let mut bytes = 0u64;
+        loop {
+            let read = source.read(&mut buffer)?;
             if read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "the file shrank while it was being archived",
-                ));
+                break;
             }
+            crc = crc_update(crc, &buffer[..read]);
+            bytes += read as u64;
             self.write(&buffer[..read])?;
-            copied += read as u64;
         }
-        Ok(())
+        Ok((crc ^ 0xFFFF_FFFF, bytes))
     }
-}
-
-/// The CRC-32 and length of a file, read in one streaming pass.
-fn checksum(path: &Path) -> io::Result<(u32, u64)> {
-    let mut source = File::open(path)?;
-    let mut buffer = [0u8; 64 * 1024];
-    let mut crc = 0xFFFF_FFFFu32;
-    let mut bytes = 0u64;
-    loop {
-        let read = source.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        bytes += read as u64;
-        crc = crc_update(crc, &buffer[..read]);
-    }
-    Ok((crc ^ 0xFFFF_FFFF, bytes))
 }
 
 /// The CRC-32 table (polynomial 0xEDB88320, the ZIP/Gzip one).
@@ -447,11 +440,27 @@ mod tests {
             let local_name_len = usize::from(u16_at(bytes, local + 26));
             let local_extra_len = usize::from(u16_at(bytes, local + 28));
             let start = local + 30 + local_name_len + local_extra_len;
-            assert_eq!(
-                u32_at(bytes, local + 14),
-                crc,
-                "the local header carries the same CRC: {name}"
-            );
+            let flags = u16_at(bytes, local + 6);
+            if flags & 0x0008 != 0 {
+                // The CRC and sizes travel in the data descriptor after the entry.
+                let descriptor = start + uncompressed as usize;
+                assert_eq!(
+                    u32_at(bytes, descriptor),
+                    DATA_DESCRIPTOR,
+                    "a data descriptor follows the entry: {name}"
+                );
+                assert_eq!(
+                    u32_at(bytes, descriptor + 4),
+                    crc,
+                    "the descriptor carries the same CRC: {name}"
+                );
+            } else {
+                assert_eq!(
+                    u32_at(bytes, local + 14),
+                    crc,
+                    "the local header carries the same CRC: {name}"
+                );
+            }
             let data = bytes[start..start + uncompressed as usize].to_vec();
             entries.push(ReadEntry {
                 name,

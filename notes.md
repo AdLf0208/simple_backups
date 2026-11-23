@@ -10,6 +10,9 @@ build` green, and the backup scenarios pass (see below). **Republished as the SD
 **0.2.2** (2026-11-21) is the disk-cap slice: `max_disk_size` (upstream `maxDiskSize`, 25 GB
 default) prunes the oldest archives after a good backup, repinned to Horizon `0a875da`; 36 tests,
 `check`/`fits` green, and the new cap scene (with its counterfactual) passed in game.
+**0.2.3** (2026-11-23) is the review fix for the cap: retention now deletes only archives the port
+can identify as its own (an archive manifest), skips both passes after a stale copy, and orders
+same-second generations numerically; 46 tests, scenarios E/F and the stale selftest in game.
 
 **Class + tier** (from `ports/ledger.csv`, per `horizon/docs/modpacks.md`):
 **server-only / logic**. The approach is the **logic shape**: a pure policy
@@ -195,15 +198,144 @@ phase that asserts it.
 | scheduled backup (tick or wall clock) | tested | scenario A: `interval_ticks=40` → a zip; scenario B: `enabled=false` → none in 100 ticks |
 | save before copy | tested | every scenario: `LevelRef::request_save` → `world_saved` → the copy starts (`status` `saves=` grows) |
 | zip of the world folder | tested | scenario A/B/D: `zipfile.testzip()` CRC pass, `level.dat` inside, no `session.lock`, no `backups/` subtree |
-| retention (`keep`) | tested | scenario A: `keep=1` leaves exactly one archive |
-| disk cap (`max_disk_size`) | tested | scenario D: `1 B` leaves the newer archive and `over=true`; `1 TB` counterfactual leaves both and `over=false` |
+| retention (`keep`) | tested | scenario A: `keep=1` leaves exactly one archive; scenario E: the older **mod-made** archive is removed while a hand-made ZIP with the same prefix stays |
+| disk cap (`max_disk_size`) | tested | scenario D: `1 B` leaves the newer archive and `over=true`; `1 TB` counterfactual leaves both and `over=false`; scenario F: the cap deletes nothing after a stale copy |
+| archive identity (own manifest) | tested | `support::tests::an_archive_identifies_itself_not_by_its_name`; every `check_zip` call parses `simplebackups.json` and asserts `format` + `world` |
+| stale copy skips retention | tested | scenario F: `stale=true` with `keep=1` and a `1 B` cap leaves both archives and `over=true`; `STALE_SELFTEST=1` asserts the pre-fix defect and exits 1 |
+| same-second generations | tested | `runtime::tests::{same_second_backups_sort_by_generation_not_as_text,the_cap_also_orders_same_second_generations_numerically}` |
 | commands `backup` / `status` / `list` | tested | `ctl chat "/simplebackups backup"` and `status` in every scenario, `list` in scenario D: the reply names every archive in the folder, and after a `1 B` cap it no longer names the deleted one |
-| save-overlap retry (`retry_on_save`) | tested | unit test `should_retry`; the e2e prints `SKIP` for the overlap (a single-player world cannot produce a second world save — recorded gap) |
+| save-overlap retry (`retry_on_save`) | tested | unit test `should_retry`; scenario F forces a real overlap with `ctl save` during a 256 MiB copy (`stale=true`, `saves=6`); scenario C's pause/resume still prints `SKIP` (that path cannot make a save) |
 | `pause` / `unpause` | not ported | gap (commands are `backup`, `status`, `list` only) |
 | empty-server policy (`noPlayerBackups`) | not ported | gap; needs a player-presence API and a way to empty the server headless |
 | `latest.log` → `backup.log` | not ported | gap (needs a path outside the world folder) |
 | disk reservation before a copy | not ported | gap (upstream's `NotEnoughDiskSpaceException`) |
 | partial / chains / merge, regex ignores, persisted schedule | not ported | gaps: the pin has no game-time API for tick persistence, and a regex needs a crate |
+
+## Slice 3 (0.2.3, 2026-11-23) — review fix: retention's identity, a stale copy, same-second order
+
+**Review.** `NikitaMGrimm` reviewed round one at `5cfa312aeee8`: the archive matched the listing and
+`check` passed, but the new disk cap could (a) leave a backup that **overlapped a save** as the only
+restore point and (b) delete **manually retained ZIPs whose names match the world prefix**, even below
+`keep`. Both came from the same root cause: retention's idea of "a backup" was the *name*
+`<world>_*.zip`, and it ran unconditionally after every publish.
+
+**Gap line.** *Gaps after the migration* item 4 / *Deliberate deviations* in this file: "The cap never
+deletes a foreign file — only `<world>_*.zip`, the same rule `keep` already had". A name prefix is not
+an identity, and a copy a save overlapped is not a restore point.
+
+**How an archive is identified as the mod's own.** Every archive the port writes carries its own
+`simplebackups.json` entry (the first entry, stored, `src/runtime::manifest`):
+
+```json
+{"format":"simplebackups/1","world":"World","backup":"World_2026-11-23_12-28-20.zip"}
+```
+
+Retention reads that entry from the archive (`zip::read_entry`: central directory → local header →
+stored bytes) and treats the file as this world's backup only when `format` **and** `world` match.
+Archives written before the marker existed (0.2.0–0.2.2) are recognised by their world-zip shape
+instead — every entry under `<world>/` and `<world>/level.dat` present — so an upgrade does not leave
+its old archives undeletable. A ZIP that matches the name prefix but has neither is never deleted, and
+`runtime::parse_archive` additionally refuses a name that is not
+`<world>_<YYYY-MM-DD_HH-MM-SS>[-<generation>].zip`.
+
+**Rules (pure, `src/runtime.rs`).** `parse_archive` parses the UTC stamp (fixed separators, 19 bytes)
+and the optional `-<n>` generation; `chronological` orders by `(stamp, generation)` so `-10` follows
+`-9` and the base name (generation 0) is the oldest of its second; `prune` and `cap_removals` take the
+**identified** archives only, and both stop before the newest one. `cap_removals` still counts every
+regular file in the folder toward the size, so a foreign file cannot hide bytes from the cap.
+
+**Glue (`src/support.rs`).** `archive_is_ours` is the identity test; `owned_archives` builds the
+retention candidates; `publish` skips **both** passes when the published copy is stale, reports the
+folder's size and `over=true`, and the completion message says `retention skipped (a save overlapped
+this copy)`. The stale copy stays on disk (it is the only copy of that moment) but never causes a
+confirmed restore point to be deleted.
+
+**Red → green.** Four failing tests first, against the 0.2.2 code; verbatim from `sdk-test-red.log`:
+
+```
+---- runtime::tests::same_second_backups_sort_by_generation_not_as_text stdout ----
+assertion `left == right` failed: the oldest nine generations go, not the ones that sort first as text
+  left: ["W_2026-11-03_12-34-56-1.zip", "W_2026-11-03_12-34-56-10.zip", "W_2026-11-03_12-34-56-2.zip", …, "W_2026-11-03_12-34-56-8.zip"]
+ right: ["W_2026-11-03_12-34-56.zip", "W_2026-11-03_12-34-56-1.zip", "W_2026-11-03_12-34-56-2.zip", …, "W_2026-11-03_12-34-56-8.zip"]
+
+---- runtime::tests::the_cap_also_orders_same_second_generations_numerically stdout ----
+assertion `left == right` failed: the cap must delete generations 0-8, never the numerically newest
+  left: ["W_2026-11-03_12-34-56-1.zip", "W_2026-11-03_12-34-56-10.zip", …]
+ right: ["W_2026-11-03_12-34-56.zip", "W_2026-11-03_12-34-56-1.zip", …]
+
+---- support::tests::a_foreign_zip_named_like_a_backup_survives_retention stdout ----
+a zip the mod did not write is not a backup and must survive
+
+---- support::tests::a_stale_copy_skips_both_retention_passes stdout ----
+keep must not run after a stale copy: ["World_2026-01-01_00-00-01.zip"]
+
+test result: FAILED. 36 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+```
+
+Green: **46 passed, 0 failed** (28 `runtime`, 7 `support`, 11 `zip`) — `sdk-test.log`.
+
+**In game (launcher-built game `native-0a875da-a2b71884a7ff`, sources byte-identical to this tree —
+`../_shared/evidence/simplebackups-e2e/build-record.txt`).** New scenario E places a hand-made ZIP
+`SimpleBackupsForeign_1999-01-01_00-00-00.zip` (entry `my-own-notes.txt`) in the folder, then takes two
+backups with `keep=1` and `max_disk_size="1 B"`:
+
+```
+hand-made archive: …/SimpleBackupsForeign_1999-01-01_00-00-00.zip
+first mod backup: …/SimpleBackupsForeign_2026-11-23_12-27-58.zip
+zip entries: 21                         # the manifest + the world
+unmanaged archive survived; the older mod archive was removed (the differential)
+```
+
+New scenario F runs with `save_before_backup=false`, takes one clean backup, adds a 256 MiB payload,
+starts a second copy and calls `ctl save` six times while it is being written:
+
+```
+clean restore point: …/SimpleBackupsStale_2026-11-23_12-28-16.zip
+status: disk=279251496 B cap=1 B over=true saves=6 retries=0 stale=true in_flight=false last=SimpleBackupsStale_2026-11-23_12-28-20.zip …
+stale copy published; both retention passes skipped: …/SimpleBackupsStale_2026-11-23_12-28-16.zip survives beside it
+```
+
+`STALE_SELFTEST=1` runs the same scene and asserts the **pre-fix** behaviour (retention ran, one archive
+left); it exits 1 either way and says which it saw — with this package:
+
+```
+FAIL: STALE_SELFTEST: retention was skipped after a stale copy (2 archives, …/SimpleBackupsStaleSelf_… kept) — the pre-fix defect is gone, so the assertion is alive
+EXIT:1
+```
+
+Evidence: `../_shared/evidence/simplebackups-e2e/e2e-launcher.log` (`PASS` + `EXIT:0`),
+`…-control.log` (`EXIT:1`, the unmodded game makes no backup), `…-selftest.log` (`EXIT:1`),
+`…-stale-selftest.log` (`EXIT:1`); `check-e2e-logs.py simplebackups-e2e --strict` → `logs=4 ok=4`.
+
+### Package 0.2.3
+
+| | |
+|---|---|
+| version | **0.2.3** (`horizon-mod.toml` + `Cargo.toml`) |
+| bytes | **45,307 B** |
+| sha256 | `4c9061c0e2c5f5f2baec76a14b764293655120522f16992b90f133a0aa5c592a` |
+| entries | **10** — `horizon-mod.toml`, `Cargo.toml`, `LICENSE`, `LICENSE-NOTICE.md`, `README.md`, `src/{lib,runtime,support,zip}.rs`, `uses.json`; **no `Cargo.lock`** |
+| reproducible | second build after `rm -f Cargo.lock`: `cmp` identical, same sha |
+| `check` | `simplebackups 0.2.3 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, 45,307 bytes, exit 0 |
+| `fits --build 0a875da…` | `0a875da  made for` (the pin tautology, kept as the pin line) |
+| `fits --build 0b14f8a…` | `0b14f8a  fits` — the real gate, exit 0 |
+| tests | **46 passed, 0 failed** — 28 `runtime`, 7 `support`, 11 `zip` |
+| `verify-sdk-package.py` | `1/1`, `package matches the tree` |
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review
+
+### Changelog (0.2.3)
+
+> **0.2.3 — retention only deletes the port's own archives, and never after a stale copy.** Every
+> backup now carries a `simplebackups.json` manifest (`format = simplebackups/1`, the world name), and
+> `keep`/`max_disk_size` delete only archives whose manifest identifies them (0.2.0–0.2.2 archives are
+> recognised by their `<world>/…` + `level.dat` shape). A hand-made ZIP that matches the world prefix is
+> never deleted, however old its name. When a copy is published `stale=true` (a save overlapped it),
+> **both** retention passes are skipped so the previous confirmed restore point stays — the folder may
+> report `over=true` until the next good backup. Same-second backups are ordered by their numeric
+> generation (`-10` after `-9`), so the newest one is never treated as the oldest. 46 tests; proven in
+> game by scenario E (hand-made archive survives, older mod archive removed) and scenario F (stale copy
+> leaves the clean one).
 
 ## Verification (re-pin `83ad384f`, 2026-11-06/07)
 
@@ -260,9 +392,9 @@ works while disabled`.
   Empty-server policy, disk cap, pause/unpause, `latest.log` capture,
   incremental/chains/merge, Cherished Worlds/mc2discord and regex ignores are
   deferred.
-- Retention prunes after success (upstream deletes before creating), and only
-  `<world>_*.zip` (upstream counts every file); both are deliberate safety
-  changes.
+- Retention prunes after success (upstream deletes before creating), only archives the port can
+  identify as its own (a manifest since 0.2.3; the world-zip shape for 0.2.0–0.2.2), and after a
+  stale copy it prunes nothing at all; all three are deliberate safety changes.
 - Naming is UTC; upstream uses local time. Backup location is
   `<world>/backups` (upstream `<cwd>/simplebackups/<world>`).
 - `native_world_dir` is a pin gap: it is not cleared after a close, so the port

@@ -284,19 +284,156 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year + i64::from(month <= 2), month as u32, day as u32)
 }
 
-/// Backup names the retention policy may delete, oldest first.
-pub fn prune(names: &[String], world: &str, keep: usize) -> Vec<String> {
+/// The marker entry every archive this port writes carries, so retention can tell its own
+/// backups from any other ZIP that happens to sit in the folder (a hand-made archive with the
+/// world prefix, another tool's backup, a map a player kept). `zip::read_entry` reads it.
+pub const MANIFEST_ENTRY: &str = "simplebackups.json";
+
+/// The manifest's format tag; a different value is not this port's archive.
+pub const MANIFEST_FORMAT: &str = "simplebackups/1";
+
+/// One archive **this port wrote**, as its name and bytes identify it. Retention never touches
+/// an archive it cannot build one of these for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Archive {
+    pub name: String,
+    /// The UTC stamp (`YYYY-MM-DD_HH-MM-SS`) the name carries.
+    pub stamp: String,
+    /// The collision suffix: 0 for the base name, then `-1`, `-2` … (numeric, not text).
+    pub generation: u64,
+    pub bytes: u64,
+}
+
+/// Parse `<world>_<YYYY-MM-DD_HH-MM-SS>[-<generation>].zip`. The generation is numeric, so
+/// `-10` follows `-9` and the base name is generation 0.
+#[must_use]
+pub fn parse_archive(name: &str, world: &str, bytes: u64) -> Option<Archive> {
+    let rest = name
+        .strip_prefix(world)?
+        .strip_prefix('_')?
+        .strip_suffix(".zip")?;
+    if rest.len() < 19 {
+        return None;
+    }
+    let (stamp, suffix) = rest.split_at(19);
+    if !is_stamp(stamp) {
+        return None;
+    }
+    let generation = if suffix.is_empty() {
+        0
+    } else {
+        let digits = suffix.strip_prefix('-')?;
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()?
+    };
+    Some(Archive {
+        name: name.to_owned(),
+        stamp: stamp.to_owned(),
+        generation,
+        bytes,
+    })
+}
+
+fn is_stamp(stamp: &str) -> bool {
+    let bytes = stamp.as_bytes();
+    bytes.len() == 19
+        && [4, 7].iter().all(|at| bytes[*at] == b'-')
+        && bytes[10] == b'_'
+        && [13, 16].iter().all(|at| bytes[*at] == b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(at, byte)| matches!(at, 4 | 7 | 10 | 13 | 16) || byte.is_ascii_digit())
+}
+
+/// The manifest an archive carries. Identity is `format` + `world`; `backup` is for a reader.
+#[must_use]
+pub fn manifest(world: &str, backup: &str) -> String {
+    format!(
+        "{{\"format\":\"{MANIFEST_FORMAT}\",\"world\":{},\"backup\":{}}}",
+        json_string(world),
+        json_string(backup)
+    )
+}
+
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Whether a manifest names this port and this world.
+#[must_use]
+pub fn manifest_identifies(text: &str, world: &str) -> bool {
+    json_field(text, "format").as_deref() == Some(MANIFEST_FORMAT)
+        && json_field(text, "world").as_deref() == Some(world)
+}
+
+/// One string field of the port's own flat manifest (no nested objects).
+fn json_field(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let at = text.find(&needle)? + needle.len();
+    let rest = text[at..].trim_start().strip_prefix(':')?.trim_start();
+    let mut chars = rest.strip_prefix('"')?.chars();
+    let mut out = String::new();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    let digits: String = chars.by_ref().take(4).collect();
+                    out.push(char::from_u32(u32::from_str_radix(&digits, 16).ok()?)?);
+                }
+                _ => return None,
+            },
+            ch => out.push(ch),
+        }
+    }
+    None
+}
+
+/// The archives oldest first: the UTC stamp, then the **numeric** generation. Text order puts
+/// `-10` before `-2` and the base name after every `-N`, which would keep the wrong archive.
+fn chronological(archives: &[Archive]) -> Vec<&Archive> {
+    let mut ordered: Vec<&Archive> = archives.iter().collect();
+    ordered.sort_by(|left, right| {
+        (left.stamp.as_str(), left.generation).cmp(&(right.stamp.as_str(), right.generation))
+    });
+    ordered
+}
+
+/// Archives the `keep` rule removes, oldest first. The caller passes only archives it has
+/// identified as this port's, and the newest one always stays (the confirmed restore point).
+#[must_use]
+pub fn prune(archives: &[Archive], keep: usize) -> Vec<String> {
     let keep = keep.max(1);
-    let prefix = format!("{world}_");
-    let mut candidates: Vec<&String> = names
-        .iter()
-        .filter(|name| {
-            name.starts_with(&prefix) && name.ends_with(".zip") && !name.ends_with(".part")
-        })
-        .collect();
-    candidates.sort();
-    let remove = candidates.len().saturating_sub(keep);
-    candidates.into_iter().take(remove).cloned().collect()
+    let ordered = chronological(archives);
+    let remove = ordered.len().saturating_sub(keep);
+    ordered
+        .into_iter()
+        .take(remove)
+        .map(|archive| archive.name.clone())
+        .collect()
 }
 
 fn normalise(relative: &str) -> Option<String> {
@@ -425,25 +562,18 @@ pub struct CapPlan {
     pub over: bool,
 }
 
-/// Plan the archives the cap removes: the whole folder counts toward the cap, only this world's
-/// `<world>_*.zip` files are ever deleted, oldest first, and never the last one standing.
+/// Plan the archives the cap removes: the whole folder counts toward the cap, only archives the
+/// caller identified as this port's are ever deleted, oldest first, and never the newest one.
 #[must_use]
-pub fn cap_removals(entries: &[(String, u64)], world: &str, cap: u64) -> CapPlan {
+pub fn cap_removals(entries: &[(String, u64)], archives: &[Archive], cap: u64) -> CapPlan {
     let mut remaining_bytes: u64 = entries.iter().map(|(_, size)| *size).sum();
-    let prefix = format!("{world}_");
-    let mut candidates: Vec<(&str, u64)> = entries
-        .iter()
-        .filter(|(name, _)| name.starts_with(&prefix) && name.ends_with(".zip"))
-        .map(|(name, size)| (name.as_str(), *size))
-        .collect();
-    // The names are UTC timestamps, so lexical order is chronological order.
-    candidates.sort_by(|a, b| a.0.cmp(b.0));
+    let ordered = chronological(archives);
     let mut remove = Vec::new();
     let mut index = 0;
-    while remaining_bytes > cap && candidates.len().saturating_sub(index) > 1 {
-        let (name, size) = candidates[index];
-        remove.push(name.to_owned());
-        remaining_bytes -= size;
+    while remaining_bytes > cap && ordered.len().saturating_sub(index) > 1 {
+        let archive = ordered[index];
+        remove.push(archive.name.clone());
+        remaining_bytes = remaining_bytes.saturating_sub(archive.bytes);
         index += 1;
     }
     CapPlan {
@@ -557,28 +687,41 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prune_keeps_the_newest() {
-        let names = vec![
-            "W_1.zip".to_owned(),
-            "W_2.zip".to_owned(),
-            "W_3.zip".to_owned(),
-        ];
-        assert_eq!(prune(&names, "W", 2), ["W_1.zip"]);
-        assert_eq!(prune(&names, "W", 1), ["W_1.zip", "W_2.zip"]);
-        assert!(prune(&names, "W", 3).is_empty());
+    /// The archives named, as the glue builds them after it has identified each one.
+    fn archives(names: &[&str]) -> Vec<Archive> {
+        names
+            .iter()
+            .map(|name| parse_archive(name, "W", 1).expect("a backup name"))
+            .collect()
+    }
+
+    fn archive(name: &str, bytes: u64) -> Archive {
+        parse_archive(name, "W", bytes).expect("a backup name")
     }
 
     #[test]
-    fn prune_ignores_foreign_files() {
-        let names = vec![
-            "other.zip".to_owned(),
-            "W_1.zip.part".to_owned(),
-            "notes.txt".to_owned(),
-            "W_1.zip".to_owned(),
-            "W_2.zip".to_owned(),
+    fn prune_keeps_the_newest() {
+        let names = [
+            "W_2026-01-01_00-00-01.zip",
+            "W_2026-01-01_00-00-02.zip",
+            "W_2026-01-01_00-00-03.zip",
         ];
-        assert_eq!(prune(&names, "W", 1), ["W_1.zip"]);
+        let candidates = archives(&names);
+        assert_eq!(prune(&candidates, 2), [names[0]]);
+        assert_eq!(prune(&candidates, 1), [names[0], names[1]]);
+        assert!(prune(&candidates, 3).is_empty());
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_backup_is_never_an_archive() {
+        // Retention is driven by parsed names, not by a prefix test: a hand-made ZIP that
+        // merely shares the world prefix has no archive identity to delete.
+        assert!(parse_archive("World_notes.zip", "World", 1).is_none());
+        assert!(parse_archive("World_2026-01-01_00-00-00.zip.part", "World", 1).is_none());
+        assert!(parse_archive("Other_2026-01-01_00-00-00.zip", "World", 1).is_none());
+        assert!(parse_archive("World_2026-01-01_00-00-00-1.zip", "World", 1).is_some());
+        assert!(parse_archive("World_2026-01-01_00-00-00-x.zip", "World", 1).is_none());
+        assert!(parse_archive("World_2026-01-01_00-00-00-.zip", "World", 1).is_none());
     }
 
     #[test]
@@ -746,31 +889,49 @@ mod tests {
     #[test]
     fn the_cap_removes_the_oldest_archives_first_but_never_the_last() {
         let entries = vec![
-            ("W_1.zip".to_owned(), 600),
-            ("W_2.zip".to_owned(), 600),
-            ("W_3.zip".to_owned(), 600),
+            ("W_2026-01-01_00-00-01.zip".to_owned(), 600),
+            ("W_2026-01-01_00-00-02.zip".to_owned(), 600),
+            ("W_2026-01-01_00-00-03.zip".to_owned(), 600),
         ];
-        let plan = cap_removals(&entries, "W", 500);
-        assert_eq!(plan.remove, ["W_1.zip", "W_2.zip"]);
+        let candidates = vec![
+            archive("W_2026-01-01_00-00-01.zip", 600),
+            archive("W_2026-01-01_00-00-02.zip", 600),
+            archive("W_2026-01-01_00-00-03.zip", 600),
+        ];
+        let plan = cap_removals(&entries, &candidates, 500);
+        assert_eq!(
+            plan.remove,
+            ["W_2026-01-01_00-00-01.zip", "W_2026-01-01_00-00-02.zip"]
+        );
         assert_eq!(plan.remaining_bytes, 600, "the newest archive stays");
         assert!(plan.over, "one archive is still bigger than the cap");
-        let plan = cap_removals(&entries, "W", 2_000);
+        let plan = cap_removals(&entries, &candidates, 2_000);
         assert!(plan.remove.is_empty());
         assert_eq!(plan.remaining_bytes, 1_800);
         assert!(!plan.over);
     }
 
     #[test]
-    fn the_cap_counts_the_folder_but_only_deletes_our_archives() {
+    fn the_cap_counts_the_folder_but_only_deletes_identified_archives() {
+        // The size counts every file (so the cap cannot be hidden behind a foreign file), but
+        // only an archive the caller identified is a deletion candidate.
         let entries = vec![
-            ("W_1.zip".to_owned(), 400),
-            ("W_2.zip".to_owned(), 400),
-            ("Other_1.zip".to_owned(), 400),
+            ("W_2026-01-01_00-00-01.zip".to_owned(), 400),
+            ("W_2026-01-01_00-00-02.zip".to_owned(), 400),
+            ("Other_2026-01-01_00-00-01.zip".to_owned(), 400),
             ("someone-elses-map.zip".to_owned(), 5_000),
             ("notes.txt".to_owned(), 100),
         ];
-        let plan = cap_removals(&entries, "W", 1_000);
-        assert_eq!(plan.remove, ["W_1.zip"], "nothing foreign is deleted");
+        let candidates = vec![
+            archive("W_2026-01-01_00-00-01.zip", 400),
+            archive("W_2026-01-01_00-00-02.zip", 400),
+        ];
+        let plan = cap_removals(&entries, &candidates, 1_000);
+        assert_eq!(
+            plan.remove,
+            ["W_2026-01-01_00-00-01.zip"],
+            "nothing unidentified is deleted"
+        );
         assert_eq!(plan.remaining_bytes, 5_900);
         assert!(plan.over);
     }
@@ -781,5 +942,81 @@ mod tests {
         let (parsed, warnings) = parse(&to_toml(&config));
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(parsed, config);
+    }
+
+    /// Eleven archives written inside one second: the base name is generation 0, then
+    /// `-1` … `-10`. As text, `-10` sorts before `-2` and `-1` sorts before the base.
+    fn same_second_names() -> Vec<String> {
+        (0..=10)
+            .map(|generation| {
+                if generation == 0 {
+                    "W_2026-11-03_12-34-56.zip".to_owned()
+                } else {
+                    format!("W_2026-11-03_12-34-56-{generation}.zip")
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn same_second_backups_sort_by_generation_not_as_text() {
+        let names = same_second_names();
+        let candidates: Vec<Archive> = names
+            .iter()
+            .map(|name| parse_archive(name, "W", 1).expect("a backup name"))
+            .collect();
+        let removed = prune(&candidates, 2);
+        assert_eq!(
+            removed,
+            names[..9].to_vec(),
+            "the oldest nine generations go, not the ones that sort first as text"
+        );
+        assert!(
+            !removed.contains(&names[10]),
+            "generation 10 is the newest, not the first to go"
+        );
+        assert!(
+            !removed.contains(&names[9]),
+            "generation 9 is second newest"
+        );
+    }
+
+    #[test]
+    fn the_cap_also_orders_same_second_generations_numerically() {
+        let names = same_second_names();
+        let entries: Vec<(String, u64)> = names.iter().cloned().map(|name| (name, 1_000)).collect();
+        let candidates: Vec<Archive> = names
+            .iter()
+            .map(|name| parse_archive(name, "W", 1_000).expect("a backup name"))
+            .collect();
+        let plan = cap_removals(&entries, &candidates, 2_000);
+        assert_eq!(
+            plan.remove,
+            names[..9].to_vec(),
+            "the cap must delete generations 0-8, never the numerically newest"
+        );
+        assert_eq!(plan.remaining_bytes, 2_000);
+        assert!(!plan.over);
+    }
+
+    #[test]
+    fn the_manifest_identifies_this_port_and_world_only() {
+        let text = manifest("World", "World_2026-11-03_12-34-56.zip");
+        assert!(manifest_identifies(&text, "World"));
+        assert!(!manifest_identifies(&text, "Other"));
+        assert!(!manifest_identifies(
+            "{\"format\":\"other/1\",\"world\":\"World\"}",
+            "World"
+        ));
+        assert!(!manifest_identifies("not a manifest", "World"));
+        assert!(
+            !manifest_identifies("{\"format\":\"simplebackups/1\"}", "World"),
+            "a manifest without a world is not an identity"
+        );
+        let quoted = manifest("World \"quoted\"", "x.zip");
+        assert!(
+            manifest_identifies(&quoted, "World \"quoted\""),
+            "the writer escapes what the reader unescapes: {quoted}"
+        );
     }
 }

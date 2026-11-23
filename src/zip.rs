@@ -11,7 +11,7 @@
 //! size of the world instead of deflated — is recorded in `notes.md`.
 
 use std::fs::File;
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 /// Signature of a local file header.
@@ -88,6 +88,25 @@ impl<W: Write + Seek> ZipWriter<W> {
     ///
     /// The file could not be read, or the writer failed.
     pub fn add_file(&mut self, name: &str, path: &Path) -> io::Result<()> {
+        let local_offset = self.begin_entry(name)?;
+        let (crc, bytes) = self.copy_computing(path)?;
+        self.end_entry(name, local_offset, crc, bytes)
+    }
+
+    /// Add a byte slice as the stored entry `name` (the port's manifest uses this).
+    ///
+    /// # Errors
+    ///
+    /// The entry name is too long, or the writer failed.
+    pub fn add_bytes(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let crc = crc_update(0xFFFF_FFFF, bytes) ^ 0xFFFF_FFFF;
+        let local_offset = self.begin_entry(name)?;
+        self.write(bytes)?;
+        self.end_entry(name, local_offset, crc, bytes.len() as u64)
+    }
+
+    /// Write the local header for `name` and return its offset.
+    fn begin_entry(&mut self, name: &str) -> io::Result<u64> {
         let name_len = u16::try_from(name.len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "the entry name is too long")
         })?;
@@ -108,8 +127,12 @@ impl<W: Write + Seek> ZipWriter<W> {
         put_u16(&mut header, 0);
         header.extend_from_slice(name.as_bytes());
         self.write(&header)?;
-        let (crc, bytes) = self.copy_computing(path)?;
-        let zip64 = force || bytes >= MAX_32;
+        Ok(local_offset)
+    }
+
+    /// Write the data descriptor for the entry that started at `local_offset`.
+    fn end_entry(&mut self, name: &str, local_offset: u64, crc: u32, bytes: u64) -> io::Result<()> {
+        let zip64 = self.force_zip64 || bytes >= MAX_32;
         let mut descriptor = Vec::with_capacity(24);
         put_u32(&mut descriptor, DATA_DESCRIPTOR);
         put_u32(&mut descriptor, crc);
@@ -121,7 +144,6 @@ impl<W: Write + Seek> ZipWriter<W> {
             put_u32(&mut descriptor, bytes as u32);
         }
         self.write(&descriptor)?;
-
         self.entries.push(Entry {
             name: name.to_owned(),
             crc,
@@ -309,6 +331,192 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
 
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// The largest entry [`read_entry`] loads. Only the manifest is read in production; this bounds
+/// a hostile archive rather than a real one.
+const MAX_ENTRY_READ: u64 = 1 << 20;
+
+/// The most central-directory records a reader indexes.
+const MAX_RECORDS: u64 = 1_000_000;
+
+/// The most bytes of central directory a reader loads.
+const MAX_CENTRAL: u64 = 64 * 1024 * 1024;
+
+/// One central-directory record, with the local header located but not yet parsed.
+struct Record {
+    name: String,
+    local: u64,
+    bytes: u64,
+    method: u16,
+}
+
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn u16_at(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&bytes[at..at + 8]);
+    u64::from_le_bytes(word)
+}
+
+/// The values a ZIP64 extra field carries, in the order the 0xFFFFFFFF placeholders named them.
+fn zip64_values(extra: &[u8]) -> Vec<u64> {
+    let mut at = 0;
+    while at + 4 <= extra.len() {
+        let id = u16_at(extra, at);
+        let len = usize::from(u16_at(extra, at + 2));
+        if at + 4 + len > extra.len() {
+            return Vec::new();
+        }
+        if id == ZIP64_EXTRA {
+            let fields = &extra[at + 4..at + 4 + len];
+            return (0..fields.len() / 8)
+                .filter(|index| (index + 1) * 8 <= fields.len())
+                .map(|index| u64_at(fields, index * 8))
+                .collect();
+        }
+        at += 4 + len;
+    }
+    Vec::new()
+}
+
+/// Index an archive's central directory.
+fn records(file: &mut File) -> io::Result<Vec<Record>> {
+    let len = file.seek(SeekFrom::End(0))?;
+    if len < 22 {
+        return Err(invalid("no end-of-central-directory record"));
+    }
+    let window = len.min(22 + u64::from(MAX_16));
+    let start = len - window;
+    let mut tail = vec![0u8; window as usize];
+    file.seek(SeekFrom::Start(start))?;
+    file.read_exact(&mut tail)?;
+    let eocd = (0..=tail.len() - 22)
+        .rev()
+        .find(|at| u32_at(&tail, *at) == END_OF_CENTRAL)
+        .ok_or_else(|| invalid("no end-of-central-directory record"))?;
+    let mut count = u64::from(u16_at(&tail, eocd + 10));
+    let mut cd_size = u64::from(u32_at(&tail, eocd + 12));
+    let mut cd_offset = u64::from(u32_at(&tail, eocd + 16));
+    if count == u64::from(MAX_16) || cd_size == MAX_32 || cd_offset == MAX_32 {
+        if eocd < 20 || u32_at(&tail, eocd - 20) != ZIP64_LOCATOR {
+            return Err(invalid("no ZIP64 end-of-central-directory locator"));
+        }
+        let zip64 = u64_at(&tail, eocd - 12);
+        if zip64 + 56 > len {
+            return Err(invalid("ZIP64 end record outside the file"));
+        }
+        let mut end = [0u8; 56];
+        file.seek(SeekFrom::Start(zip64))?;
+        file.read_exact(&mut end)?;
+        if u32_at(&end, 0) != ZIP64_END_OF_CENTRAL {
+            return Err(invalid("not a ZIP64 end-of-central-directory record"));
+        }
+        count = u64_at(&end, 32);
+        cd_size = u64_at(&end, 40);
+        cd_offset = u64_at(&end, 48);
+    }
+    if count > MAX_RECORDS || cd_size > MAX_CENTRAL || cd_offset.saturating_add(cd_size) > len {
+        return Err(invalid("central directory does not fit the file"));
+    }
+    let mut central = vec![0u8; cd_size as usize];
+    file.seek(SeekFrom::Start(cd_offset))?;
+    file.read_exact(&mut central)?;
+    let mut at = 0usize;
+    let mut out = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        if at + 46 > central.len() || u32_at(&central, at) != CENTRAL_HEADER {
+            return Err(invalid("truncated or malformed central directory"));
+        }
+        let method = u16_at(&central, at + 10);
+        let compressed = u64::from(u32_at(&central, at + 20));
+        let uncompressed = u64::from(u32_at(&central, at + 24));
+        let name_len = usize::from(u16_at(&central, at + 28));
+        let extra_len = usize::from(u16_at(&central, at + 30));
+        let comment_len = usize::from(u16_at(&central, at + 32));
+        let local = u64::from(u32_at(&central, at + 42));
+        let end = at + 46 + name_len + extra_len + comment_len;
+        if end > central.len() {
+            return Err(invalid("central-directory record overruns itself"));
+        }
+        let name = String::from_utf8(central[at + 46..at + 46 + name_len].to_vec())
+            .map_err(|_| invalid("an entry name is not UTF-8"))?;
+        let extra = &central[at + 46 + name_len..at + 46 + name_len + extra_len];
+        let mut values = zip64_values(extra).into_iter();
+        let mut take = |field: u64| -> io::Result<u64> {
+            if field == MAX_32 {
+                values
+                    .next()
+                    .ok_or_else(|| invalid("a ZIP64 field is missing"))
+            } else {
+                Ok(field)
+            }
+        };
+        let _uncompressed = take(uncompressed)?;
+        let bytes = take(compressed)?;
+        let local = take(local)?;
+        out.push(Record {
+            name,
+            local,
+            bytes,
+            method,
+        });
+        at = end;
+    }
+    Ok(out)
+}
+
+/// Read one stored entry from the archive at `path`, or `None` when it has no such entry (or the
+/// entry is compressed and this reader cannot decode it).
+///
+/// # Errors
+///
+/// The file cannot be read, or is not a ZIP archive this reader understands.
+pub fn read_entry(path: &Path, wanted: &str) -> io::Result<Option<Vec<u8>>> {
+    let mut file = File::open(path)?;
+    let index = records(&mut file)?;
+    let Some(record) = index.iter().find(|record| record.name == wanted) else {
+        return Ok(None);
+    };
+    if record.method != METHOD_STORED || record.bytes > MAX_ENTRY_READ {
+        return Ok(None);
+    }
+    let mut header = [0u8; 30];
+    file.seek(SeekFrom::Start(record.local))?;
+    file.read_exact(&mut header)?;
+    if u32_at(&header, 0) != LOCAL_HEADER {
+        return Err(invalid("the local header is not where the directory says"));
+    }
+    let name_len = u64::from(u16_at(&header, 26));
+    let extra_len = u64::from(u16_at(&header, 28));
+    let data = record.local + 30 + name_len + extra_len;
+    let mut bytes = vec![0u8; record.bytes as usize];
+    file.seek(SeekFrom::Start(data))?;
+    file.read_exact(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+/// The entry names of the archive at `path`, from its central directory.
+///
+/// # Errors
+///
+/// The file cannot be read, or is not a ZIP archive this reader understands.
+pub fn entry_names(path: &Path) -> io::Result<Vec<String>> {
+    let mut file = File::open(path)?;
+    Ok(records(&mut file)?
+        .into_iter()
+        .map(|record| record.name)
+        .collect())
 }
 
 #[cfg(test)]
@@ -523,6 +731,88 @@ mod tests {
         assert_eq!(entries[1].name, "World/region/r.0.0.mca");
         assert!(entries[1].bytes.is_empty(), "an empty file is an entry");
         assert_eq!(entries[1].crc, 0, "the CRC of nothing is zero");
+    }
+
+    #[test]
+    fn a_manifest_entry_is_read_back_from_the_archive() {
+        let scratch = Scratch::new("read-entry");
+        let level = scratch.file("level.dat", b"level data");
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .add_bytes(
+                "simplebackups.json",
+                br#"{"format":"simplebackups/1","world":"World"}"#,
+            )
+            .expect("manifest");
+        writer.add_file("World/level.dat", &level).expect("level");
+        let bytes = writer.finish().expect("finish").into_inner();
+        let archive = scratch.0.join("archive.zip");
+        std::fs::write(&archive, &bytes).expect("write archive");
+
+        assert_eq!(
+            read_entry(&archive, "simplebackups.json")
+                .expect("read")
+                .as_deref(),
+            Some(br#"{"format":"simplebackups/1","world":"World"}"#.as_slice())
+        );
+        assert!(
+            read_entry(&archive, "missing").expect("read").is_none(),
+            "an absent entry is None, not an error"
+        );
+        assert_eq!(
+            entry_names(&archive).expect("names"),
+            ["simplebackups.json", "World/level.dat"]
+        );
+        assert_eq!(read_archive(&bytes).len(), 2, "still a well-formed archive");
+    }
+
+    #[test]
+    fn a_zip_without_the_manifest_has_no_entry_to_read() {
+        let scratch = Scratch::new("read-missing");
+        let bytes = build(&scratch, &[("notes.txt", b"hello")]);
+        let archive = scratch.0.join("foreign.zip");
+        std::fs::write(&archive, &bytes).expect("write archive");
+        assert!(
+            read_entry(&archive, "simplebackups.json")
+                .expect("read")
+                .is_none()
+        );
+        assert_eq!(entry_names(&archive).expect("names"), ["notes.txt"]);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_zip_is_an_error_not_an_empty_archive() {
+        let scratch = Scratch::new("not-a-zip");
+        let path = scratch.0.join("notes.zip");
+        std::fs::write(&path, b"not a zip at all").expect("write");
+        assert!(read_entry(&path, "simplebackups.json").is_err());
+        assert!(entry_names(&path).is_err());
+    }
+
+    #[test]
+    fn a_zip64_archive_reads_its_entries_back() {
+        let scratch = Scratch::new("read-zip64");
+        let level = scratch.file("level.dat", b"a world file");
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        writer.force_zip64();
+        writer
+            .add_bytes("simplebackups.json", b"{\"format\":\"simplebackups/1\"}")
+            .expect("manifest");
+        writer.add_file("World/level.dat", &level).expect("level");
+        let bytes = writer.finish().expect("finish").into_inner();
+        let archive = scratch.0.join("zip64.zip");
+        std::fs::write(&archive, &bytes).expect("write archive");
+
+        assert_eq!(
+            read_entry(&archive, "simplebackups.json")
+                .expect("read")
+                .as_deref(),
+            Some(b"{\"format\":\"simplebackups/1\"}".as_slice())
+        );
+        assert_eq!(
+            entry_names(&archive).expect("names"),
+            ["simplebackups.json", "World/level.dat"]
+        );
     }
 
     #[test]

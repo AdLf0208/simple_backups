@@ -27,10 +27,11 @@ use mod_api::{
 };
 
 use crate::runtime::{
-    Settings, backup_file_name, cap_removals, copy_is_stale, due_by_millis, due_by_ticks,
-    entry_name, format_size, format_size_setting, parse, prune, should_skip, to_toml,
+    Archive, MANIFEST_ENTRY, Settings, backup_file_name, cap_removals, copy_is_stale,
+    due_by_millis, due_by_ticks, entry_name, format_size, format_size_setting, manifest,
+    manifest_identifies, parse, parse_archive, prune, should_skip, to_toml,
 };
-use crate::zip::ZipWriter;
+use crate::zip::{ZipWriter, entry_names, read_entry};
 
 /// The port's config file in the game's `config/` folder: `<mod id>.toml`, which the service
 /// hands to the mod that owns it.
@@ -71,8 +72,8 @@ struct Report {
     disk_bytes: u64,
     /// The folder is still over the cap with one archive left (upstream logs an error here).
     over_cap: bool,
-    /// Published even though a save overlapped it (retries exhausted or off).
-    stale: bool,
+    /// Both retention passes were skipped because the published copy is stale.
+    retention_skipped: bool,
 }
 
 #[derive(Default)]
@@ -358,8 +359,8 @@ pub fn on_server_tick(host: &mut dyn ServerHost, world_running: bool) {
                                 format_size_setting(core.cfg.max_disk_bytes)
                             ));
                         }
-                        if report.stale {
-                            message.push_str("; a save overlapped this copy");
+                        if report.retention_skipped {
+                            message.push_str("; retention skipped (a save overlapped this copy)");
                         }
                         core.last_completed = Some(report.name);
                         core.last_error = None;
@@ -560,6 +561,14 @@ fn run_backup(
             .open(&part)
             .map_err(|error| error.to_string())?;
         let mut zip = ZipWriter::new(BufWriter::new(file));
+        // The marker every archive carries: retention deletes only an archive whose manifest
+        // names this port and this world, never a ZIP that merely matches the name prefix.
+        let backup_name = final_path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        let marker = manifest(&world_name, &backup_name);
+        zip.add_bytes(MANIFEST_ENTRY, marker.as_bytes())
+            .map_err(|error| error.to_string())?;
         walk(
             &mut zip,
             world,
@@ -604,22 +613,24 @@ fn publish(core: &mut Core, copy: &Copy, stale: bool) -> Result<Report, String> 
         let _ = fs::remove_file(&copy.part);
         error.to_string()
     })?;
-    let names: Vec<String> = fs::read_dir(&backups)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
-    let deleted = prune(&names, &world_name, core.cfg.keep);
-    for name in &deleted {
-        let _ = fs::remove_file(backups.join(name));
-    }
-    // Upstream enforces `maxDiskSize` after a good backup (`BackupThread.java:154-178`): the
-    // oldest archives go while the folder is over the cap, and the last one always stays.
-    let (cap_removed, disk_bytes, over_cap) =
-        enforce_cap(&backups, &world_name, core.cfg.max_disk_bytes);
+    let cap = core.cfg.max_disk_bytes;
+    let (deleted, cap_removed, disk_bytes, over_cap, retention_skipped) = if stale {
+        // Both passes are skipped. This copy may hold a region file a save was replacing, so it
+        // is not a restore point; deleting the previous confirmed one (by `keep` or by the cap)
+        // would leave the stale copy as the only thing to restore from.
+        let disk_bytes = folder_bytes(&backups);
+        (Vec::new(), Vec::new(), disk_bytes, disk_bytes > cap, true)
+    } else {
+        let archives = owned_archives(&backups, &world_name);
+        let deleted = prune(&archives, core.cfg.keep);
+        for name in &deleted {
+            let _ = fs::remove_file(backups.join(name));
+        }
+        // Upstream enforces `maxDiskSize` after a good backup (`BackupThread.java:154-178`): the
+        // oldest archives go while the folder is over the cap, and the newest one always stays.
+        let (cap_removed, disk_bytes, over_cap) = enforce_cap(&backups, &world_name, cap);
+        (deleted, cap_removed, disk_bytes, over_cap, false)
+    };
     core.disk_bytes = disk_bytes;
     core.over_cap = over_cap;
     if stale {
@@ -636,8 +647,46 @@ fn publish(core: &mut Core, copy: &Copy, stale: bool) -> Result<Report, String> 
         cap_removed,
         disk_bytes,
         over_cap,
-        stale,
+        retention_skipped,
     })
+}
+
+/// Whether the archive at `path` is one this port wrote.
+///
+/// The marker is the archive's own `simplebackups.json` entry: `format = simplebackups/1` and
+/// this world's name. Archives written before the marker existed (0.2.0–0.2.2) are recognised by
+/// their world-zip shape instead — every entry under `<world>/` and a `<world>/level.dat` — so an
+/// upgrade does not leave its old archives undeletable. A ZIP that has the world prefix but
+/// neither the marker nor that shape is someone else's file and is never deleted.
+fn archive_is_ours(path: &Path, world: &str) -> bool {
+    match read_entry(path, MANIFEST_ENTRY) {
+        Ok(Some(bytes)) => manifest_identifies(&String::from_utf8_lossy(&bytes), world),
+        Ok(None) => legacy_world_zip(path, world),
+        Err(_) => false,
+    }
+}
+
+fn legacy_world_zip(path: &Path, world: &str) -> bool {
+    let Ok(names) = entry_names(path) else {
+        return false;
+    };
+    let prefix = format!("{world}/");
+    let level = format!("{prefix}level.dat");
+    names.iter().any(|name| name == &level) && names.iter().all(|name| name.starts_with(&prefix))
+}
+
+/// The archives in `dir` this port wrote, as retention may name them.
+fn owned_archives(dir: &Path, world: &str) -> Vec<Archive> {
+    folder_files(dir)
+        .into_iter()
+        .filter(|(name, _)| name.ends_with(".zip"))
+        .filter_map(|(name, bytes)| {
+            if !archive_is_ours(&dir.join(&name), world) {
+                return None;
+            }
+            parse_archive(&name, world, bytes)
+        })
+        .collect()
 }
 
 /// The folder's regular files as `(name, bytes)`. A folder and a symlink are not counted: the cap is
@@ -657,17 +706,24 @@ fn folder_files(dir: &Path) -> Vec<(String, u64)> {
         .unwrap_or_default()
 }
 
-/// Delete this world's oldest archives while the backup folder is over `cap`, never the last one.
-/// Returns what was removed, the folder size left, and whether it is still over the cap.
+/// The folder's regular-file bytes.
+fn folder_bytes(dir: &Path) -> u64 {
+    folder_files(dir).iter().map(|(_, bytes)| *bytes).sum()
+}
+
+/// Delete the oldest **identified** archives while the backup folder is over `cap`, never the
+/// newest one. Returns what was removed, the folder size left, and whether it is still over.
 fn enforce_cap(dir: &Path, world: &str, cap: u64) -> (Vec<String>, u64, bool) {
-    let plan = cap_removals(&folder_files(dir), world, cap);
+    let files = folder_files(dir);
+    let archives = owned_archives(dir, world);
+    let plan = cap_removals(&files, &archives, cap);
     let mut removed = Vec::new();
     for name in &plan.remove {
         if fs::remove_file(dir.join(name)).is_ok() {
             removed.push(name.clone());
         }
     }
-    let remaining: u64 = folder_files(dir).iter().map(|(_, bytes)| *bytes).sum();
+    let remaining = folder_bytes(dir);
     (removed, remaining, remaining > cap)
 }
 
@@ -914,6 +970,150 @@ mod tests {
         }
     }
 
+    /// Settings with the two retention bounds a scene needs.
+    fn settings_with(keep: usize, cap: u64) -> Settings {
+        Settings {
+            keep,
+            max_disk_bytes: cap,
+            ..Settings::default()
+        }
+    }
+
+    /// A `Core` as the tick would hold it for one open world.
+    fn core_with(world: &Path, cfg: Settings) -> Core {
+        Core {
+            cfg,
+            world: Some(world.to_path_buf()),
+            ..Core::default()
+        }
+    }
+
+    /// A plain ZIP with the given entries and **no** port marker: what a player, an old
+    /// version of another tool or a hand-made archive would leave behind.
+    fn plain_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let mut writer = crate::zip::ZipWriter::new(fs::File::create(path).expect("create zip"));
+        let source = path.with_extension("entry-src");
+        for (name, bytes) in entries {
+            fs::write(&source, bytes).expect("entry source");
+            writer.add_file(name, &source).expect("add_file");
+        }
+        let _ = fs::remove_file(&source);
+        let file = writer.finish().expect("finish");
+        file.sync_all().expect("sync");
+    }
+
+    fn archive_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("read backups")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".zip"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_stale_copy_skips_both_retention_passes() {
+        let world = scratch_world("stale-skip");
+        let backups = world.join("backups");
+        fs::create_dir_all(&backups).expect("backups folder");
+        // keep = 1 and a 1 B cap both want to delete the moment they run.
+        let cfg = settings_with(1, 1);
+        let first = run_backup(
+            &world,
+            &backups.join("World_2026-01-01_00-00-00.zip"),
+            &cfg,
+            Some("backups".to_owned()),
+        )
+        .expect("the first copy");
+        publish(&mut core_with(&world, cfg.clone()), &first, false).expect("publish first");
+        let second = run_backup(
+            &world,
+            &backups.join("World_2026-01-01_00-00-01.zip"),
+            &cfg,
+            Some("backups".to_owned()),
+        )
+        .expect("the second copy");
+        publish(&mut core_with(&world, cfg.clone()), &second, false).expect("publish second");
+        assert_eq!(
+            archive_names(&backups),
+            ["World_2026-01-01_00-00-01.zip"],
+            "the scene starts with one confirmed restore point"
+        );
+
+        let stale = run_backup(
+            &world,
+            &backups.join("World_2026-01-01_00-00-02.zip"),
+            &cfg,
+            Some("backups".to_owned()),
+        )
+        .expect("the stale copy");
+        let report = publish(&mut core_with(&world, cfg), &stale, true).expect("publish stale");
+
+        assert!(
+            report.deleted.is_empty(),
+            "keep must not run after a stale copy: {:?}",
+            report.deleted
+        );
+        assert!(
+            report.cap_removed.is_empty(),
+            "the disk cap must not run after a stale copy: {:?}",
+            report.cap_removed
+        );
+        assert_eq!(
+            archive_names(&backups),
+            [
+                "World_2026-01-01_00-00-01.zip",
+                "World_2026-01-01_00-00-02.zip"
+            ],
+            "the previous restore point survives beside the stale copy"
+        );
+        cleanup(&world);
+    }
+
+    #[test]
+    fn a_foreign_zip_named_like_a_backup_survives_retention() {
+        let world = scratch_world("foreign-zip");
+        let backups = world.join("backups");
+        fs::create_dir_all(&backups).expect("backups folder");
+        // A hand-made archive with the world prefix and an older name than any real backup:
+        // the name pattern alone would make it the first thing both passes delete.
+        let hand_made = backups.join("World_1999-01-01_00-00-00.zip");
+        plain_zip(&hand_made, &[("my-notes.txt", b"do not delete")]);
+        let cfg = settings_with(1, 1);
+        let old = run_backup(
+            &world,
+            &backups.join("World_2026-01-01_00-00-00.zip"),
+            &cfg,
+            Some("backups".to_owned()),
+        )
+        .expect("the old copy");
+        publish(&mut core_with(&world, cfg.clone()), &old, false).expect("publish old");
+        let new = run_backup(
+            &world,
+            &backups.join("World_2026-01-01_00-00-01.zip"),
+            &cfg,
+            Some("backups".to_owned()),
+        )
+        .expect("the new copy");
+        publish(&mut core_with(&world, cfg), &new, false).expect("publish new");
+
+        assert!(
+            hand_made.exists(),
+            "a zip the mod did not write is not a backup and must survive"
+        );
+        assert!(
+            !backups.join("World_2026-01-01_00-00-00.zip").exists(),
+            "the older archive of the same age is removed (the differential)"
+        );
+        assert!(
+            backups.join("World_2026-01-01_00-00-01.zip").exists(),
+            "the newest restore point survives"
+        );
+        cleanup(&world);
+    }
+
     #[test]
     fn an_overlapped_copy_is_redone_only_within_the_rule() {
         assert!(should_retry(true, true, 0));
@@ -988,25 +1188,108 @@ mod tests {
         let world = scratch_world("cap");
         let backups = world.join("backups");
         fs::create_dir_all(&backups).expect("backups folder");
-        let older = backups.join("World_2026-01-01_00-00-00.zip");
-        let newer = backups.join("World_2026-01-01_00-00-01.zip");
-        fs::write(&older, vec![0u8; 400]).expect("older archive");
-        fs::write(&newer, vec![0u8; 400]).expect("newer archive");
+        let cfg = Settings::default();
+        let older_name = "World_2026-01-01_00-00-00.zip";
+        let newer_name = "World_2026-01-01_00-00-01.zip";
+        let older = run_backup(
+            &world,
+            &backups.join(older_name),
+            &cfg,
+            Some("backups".to_owned()),
+        )
+        .expect("older archive");
+        publish(&mut core_with(&world, cfg.clone()), &older, false).expect("publish older");
+        let newer = run_backup(
+            &world,
+            &backups.join(newer_name),
+            &cfg,
+            Some("backups".to_owned()),
+        )
+        .expect("newer archive");
+        publish(&mut core_with(&world, cfg.clone()), &newer, false).expect("publish newer");
         let foreign = backups.join("someone-elses-map.zip");
-        fs::write(&foreign, vec![0u8; 5_000]).expect("foreign archive");
+        plain_zip(&foreign, &[("map.dat", &[0u8; 100])]);
 
-        let (removed, remaining, over) = enforce_cap(&backups, "World", 1_000);
+        let older_bytes = fs::metadata(backups.join(older_name)).expect("older").len();
+        let newer_bytes = fs::metadata(backups.join(newer_name)).expect("newer").len();
+        let foreign_bytes = fs::metadata(&foreign).expect("foreign").len();
+        // Exactly the newest archive plus the foreign file fits: the cap has to remove the older.
+        let cap = newer_bytes + foreign_bytes;
+        assert!(cap > older_bytes, "the scene needs a removal");
 
-        assert_eq!(
-            removed,
-            ["World_2026-01-01_00-00-00.zip"],
-            "only the oldest of our archives is removed"
+        let (removed, remaining, over) = enforce_cap(&backups, "World", cap);
+
+        assert_eq!(removed, [older_name], "only the oldest archive is removed");
+        assert_eq!(remaining, cap, "the folder still holds the foreign file");
+        assert!(!over, "the cap is satisfied");
+        assert!(
+            !backups.join(older_name).exists(),
+            "the oldest archive is gone"
         );
-        assert_eq!(remaining, 5_400, "the folder still holds the foreign file");
-        assert!(over, "one archive plus a foreign file is over 1 KB");
-        assert!(!older.exists(), "the oldest archive is gone");
-        assert!(newer.exists(), "the newest archive stays");
+        assert!(
+            backups.join(newer_name).exists(),
+            "the newest archive stays"
+        );
         assert!(foreign.exists(), "nothing foreign is deleted");
+        cleanup(&world);
+    }
+
+    #[test]
+    fn an_archive_identifies_itself_not_by_its_name() {
+        let world = scratch_world("identity");
+        let backups = world.join("backups");
+        fs::create_dir_all(&backups).expect("backups folder");
+        let cfg = Settings::default();
+        let ours_name = "World_2026-01-01_00-00-00.zip";
+        let ours = run_backup(
+            &world,
+            &backups.join(ours_name),
+            &cfg,
+            Some("backups".to_owned()),
+        )
+        .expect("our copy");
+        publish(&mut core_with(&world, cfg.clone()), &ours, false).expect("publish ours");
+        assert!(
+            archive_is_ours(&backups.join(ours_name), "World"),
+            "a copy the port wrote carries its marker"
+        );
+
+        // Same writer, same name pattern, no marker: someone else's archive.
+        let foreign = backups.join("World_2026-01-01_00-00-09.zip");
+        plain_zip(&foreign, &[("notes.txt", b"hello")]);
+        assert!(
+            !archive_is_ours(&foreign, "World"),
+            "a world prefix and a ZIP are not an identity"
+        );
+
+        // A marker for another world does not identify this world's archive either.
+        let other = backups.join("World_2026-01-01_00-00-10.zip");
+        let mut writer = crate::zip::ZipWriter::new(fs::File::create(&other).expect("create"));
+        writer
+            .add_bytes(
+                crate::runtime::MANIFEST_ENTRY,
+                crate::runtime::manifest("Other", "x.zip").as_bytes(),
+            )
+            .expect("manifest entry");
+        writer.finish().expect("finish").sync_all().expect("sync");
+        assert!(
+            !archive_is_ours(&other, "World"),
+            "another world's manifest is not this world's archive"
+        );
+
+        // An archive from before the marker (0.2.0-0.2.2) is still recognised by its shape.
+        let legacy = backups.join("World_2026-01-01_00-00-11.zip");
+        plain_zip(
+            &legacy,
+            &[
+                ("World/level.dat", b"a world"),
+                ("World/region/r.0.0.mca", b"chunk"),
+            ],
+        );
+        assert!(
+            archive_is_ours(&legacy, "World"),
+            "pre-marker archives are recognised by their world-zip shape"
+        );
         cleanup(&world);
     }
 }

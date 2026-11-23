@@ -19,6 +19,14 @@
 #   manual backups end with one (the newest) and `status` says `over=true`; with
 #   cap `1 TB` both stay and `over=false` — the counterfactual that proves the
 #   removal is the cap's doing.
+# Scenario E: retention only touches archives the port wrote. A hand-made ZIP with
+#   the world prefix and the oldest name must survive keep=1 and a 1 B cap, while
+#   the older mod-made archive beside it (the differential) is removed.
+# Scenario F: a stale copy skips both retention passes. With `save_before_backup =
+#   false`, `ctl save` lands inside a 256 MiB stored copy, so the copy is published
+#   with `stale=true`; keep=1 and a 1 B cap must then delete nothing, leaving the
+#   clean restore point beside it. STALE_SELFTEST=1 asserts the pre-fix defect
+#   (retention ran) and always exits non-zero.
 #
 # Since the SDK migration (2026-11-18) the mod is a flat `.hmod` the launcher
 # compiles into the game, so GAME must name a game the launcher built with it:
@@ -94,19 +102,31 @@ wait_for_settled() { # dir old-name want
     done
     return 1
 }
+wait_for_removal() { # path
+    local path=$1 i
+    for i in $(seq 1 80); do
+        if [ ! -e "$path" ]; then return 0; fi
+        sleep 0.25
+    done
+    return 1
+}
 status_text() { ctl chat "/simplebackups status" >/dev/null; ctl wait 5 >/dev/null; ctl messages 20 | jq -r '.chat[]' | tr '\n' ' '; }
 list_text() { ctl chat "/simplebackups list" >/dev/null; ctl wait 5 >/dev/null; ctl messages 20 | jq -r '.chat[]' | tr '\n' ' '; }
 check_zip() {
     python3 - "$1" "$2" <<'PY'
-import sys, zipfile
+import json, sys, zipfile
 path, world = sys.argv[1], sys.argv[2]
 with zipfile.ZipFile(path) as archive:
     assert archive.testzip() is None, "an entry's CRC failed"
     names = archive.namelist()
+    assert names.count("simplebackups.json") == 1, names
+    manifest = json.load(archive.open("simplebackups.json"))
+    assert manifest["format"] == "simplebackups/1", manifest
+    assert manifest["world"] == world, manifest
     assert any(name.endswith("/level.dat") for name in names), names
     assert not any(name.endswith("session.lock") for name in names), names
     assert not any("/backups/" in name for name in names), names
-    assert all(name.startswith(world + "/") for name in names), names
+    assert all(name == "simplebackups.json" or name.startswith(world + "/") for name in names), names
     print(f"zip entries: {len(names)}")
 PY
 }
@@ -126,8 +146,8 @@ launch() { # sock scratch game world
         --resources "$RES"
 }
 
-write_config() { # config-dir enabled retry_on_save [max_disk_size] [keep]
-    local dir=$1 enabled=$2 retry=$3 cap=${4:-"25 GB"} keep=${5:-1}
+write_config() { # config-dir enabled retry_on_save [max_disk_size] [keep] [save_before_backup]
+    local dir=$1 enabled=$2 retry=$3 cap=${4:-"25 GB"} keep=${5:-1} save=${6:-true}
     mkdir -p "$dir"
     cat > "$dir/simplebackups.toml" <<EOF
 enabled = $enabled
@@ -135,7 +155,7 @@ interval_minutes = 0
 interval_ticks = 40
 keep = $keep
 compression_level = 1
-save_before_backup = true
+save_before_backup = $save
 retry_on_save = $retry
 broadcast = false
 backups_dir = "backups"
@@ -318,6 +338,109 @@ run_cap_scenario() {
     rm -rf "$scratch"
 }
 
+# Scenario E: retention touches only archives the port wrote. `keep = 1` and a `1 B`
+# cap both want to delete; a hand-made ZIP with the world prefix and a 1999 name is
+# the oldest file in the folder, so a prefix rule deletes it first. It must survive,
+# while the older *mod-made* archive — the differential, same name pattern and age —
+# is removed.
+run_foreign_scenario() {
+    local world=$1 sock=$2
+    local scratch
+    scratch=$(mktemp -d "${E2E_TMP:-/tmp/opencode}/simplebackups-home.XXXXXX")
+    write_config "${CONFIG_DIR:-$scratch/config}" false true "1 B" 1
+    launch "$sock" "$scratch" "$GAME" "$world"
+    local ctl
+    ctl() { "$CTL" --socket "$sock" "$@"; }
+    ctl wait-ready 120
+    ctl wait 10
+    local backups="$scratch/saves/$world/backups"
+    mkdir -p "$backups"
+    local hand="$backups/${world}_1999-01-01_00-00-00.zip"
+    python3 - "$hand" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "w") as archive:
+    archive.writestr("my-own-notes.txt", "do not delete")
+PY
+    echo "hand-made archive: $hand"
+    ctl chat "/simplebackups backup"
+    wait_for_zip "$backups" 2 || fail "the first mod backup did not appear beside the hand-made archive"
+    local first_mod
+    first_mod=$(find "$backups" -maxdepth 1 -name '*.zip' ! -name "$(basename "$hand")" | head -1)
+    [ -n "$first_mod" ] || fail "the first mod backup was not found"
+    check_zip "$first_mod" "$world"
+    echo "first mod backup: $first_mod"
+    ctl chat "/simplebackups backup"
+    wait_for_removal "$first_mod" || fail "keep=1 did not remove the older mod archive"
+    local count newest status
+    count=$(count_zips "$backups")
+    [ "$count" -eq 2 ] || fail "expected the hand-made archive and the newest backup, got $count"
+    [ -f "$hand" ] || fail "a hand-made ZIP named like a backup was deleted"
+    newest=$(find "$backups" -maxdepth 1 -name '*.zip' -newer "$hand" ! -name "$(basename "$hand")" | head -1)
+    [ -n "$newest" ] || fail "the newest mod archive is missing"
+    check_zip "$newest" "$world"
+    status=$(status_text)
+    echo "status: $status"
+    echo "unmanaged archive survived; the older mod archive was removed (the differential)"
+    ctl quit >/dev/null 2>&1 || true
+    sleep 1
+    rm -rf "$scratch"
+}
+
+# Scenario F: a stale copy skips both retention passes. `keep = 1` and a `1 B` cap
+# would each delete the clean first backup, leaving the copy a save may have caught
+# half-written as the only restore point. `save_before_backup = false` starts the
+# second copy at once; `ctl save` while the 256 MiB stored copy is being written
+# moves the save sequence, so the copy is published as stale. Both archives must
+# stay, and the status must say the folder is over the cap (nothing was deleted).
+# STALE_SELFTEST=1 asserts the pre-fix defect (retention ran) and exits 1 either way.
+run_stale_retention_scenario() {
+    local world=$1 sock=$2
+    local scratch
+    scratch=$(mktemp -d "${E2E_TMP:-/tmp/opencode}/simplebackups-home.XXXXXX")
+    write_config "${CONFIG_DIR:-$scratch/config}" false false "1 B" 1 false
+    launch "$sock" "$scratch" "$GAME" "$world"
+    local ctl
+    ctl() { "$CTL" --socket "$sock" "$@"; }
+    ctl wait-ready 120
+    ctl wait 10
+    local world_dir="$scratch/saves/$world"
+    local backups="$world_dir/backups"
+    ctl chat "/simplebackups backup"
+    wait_for_zip "$backups" 1 || fail "the clean backup did not appear"
+    local clean
+    clean=$(first_zip "$backups")
+    check_zip "$clean" "$world"
+    echo "clean restore point: $clean"
+    # The payload makes the next stored copy take seconds, long enough for a save to land in it.
+    dd if=/dev/urandom of="$world_dir/stale-payload.bin" bs=1M count=256 status=none
+    ctl chat "/simplebackups backup"
+    local i
+    for i in 1 2 3 4 5 6; do
+        sleep 0.3
+        ctl save >/dev/null || true
+    done
+    ctl wait 300
+    wait_for_zip "$backups" 2 || fail "the second backup did not appear"
+    local status count
+    status=$(status_text)
+    echo "status: $status"
+    grep -q 'stale=true' <<<"$status" || fail "the copy was not marked stale: $status"
+    count=$(count_zips "$backups")
+    if [ "${STALE_SELFTEST:-0}" = 1 ]; then
+        if [ "$count" -eq 1 ]; then
+            fail "STALE_SELFTEST: retention ran after a stale copy (the pre-fix defect) — the assertion is alive"
+        fi
+        fail "STALE_SELFTEST: retention was skipped after a stale copy ($count archives, $clean kept) — the pre-fix defect is gone, so the assertion is alive"
+    fi
+    [ "$count" -eq 2 ] || fail "retention ran after a stale copy: $count archives, expected the clean one and the stale one"
+    [ -f "$clean" ] || fail "the previous restore point was deleted after a stale copy"
+    grep -q 'over=true' <<<"$status" || fail "a 1 B cap with retention skipped must report over=true: $status"
+    echo "stale copy published; both retention passes skipped: $clean survives beside it"
+    ctl quit >/dev/null 2>&1 || true
+    sleep 1
+    rm -rf "$scratch"
+}
+
 # The control leg: the same scene on a game without the mod creates no backup at
 # all, so "a zip appeared" is the mod's doing and not the engine's.
 run_control_scenario() {
@@ -339,6 +462,11 @@ run_control_scenario() {
     rm -rf "$scratch"
 }
 
+if [ "${STALE_SELFTEST:-0}" = 1 ]; then
+    echo "== scenario F selftest: assert retention did NOT skip after a stale copy =="
+    run_stale_retention_scenario SimpleBackupsStaleSelf /tmp/opencode/simplebackups-stale-self.sock
+    fail "STALE_SELFTEST inconclusive: the stale scene returned without its assertion"
+fi
 echo "== scenario A: scheduled backup + keep=1 =="
 run_scenario true SimpleBackupsE2E /tmp/opencode/simplebackups-a.sock
 echo "== scenario B: enabled=false counterfactual + manual =="
@@ -351,6 +479,10 @@ echo "== scenario D: the disk cap removes the oldest archive =="
 run_cap_scenario "1 B" SimpleBackupsCap /tmp/opencode/simplebackups-f.sock
 echo "== scenario D counterfactual: a 1 TB cap keeps both =="
 run_cap_scenario "1 TB" SimpleBackupsCapOff /tmp/opencode/simplebackups-g.sock
+echo "== scenario E: a hand-made ZIP named like a backup survives retention =="
+run_foreign_scenario SimpleBackupsForeign /tmp/opencode/simplebackups-h.sock
+echo "== scenario F: a stale copy skips both retention passes =="
+run_stale_retention_scenario SimpleBackupsStale /tmp/opencode/simplebackups-i.sock
 # The control is opt-in (CONTROL=1 with CONTROL_GAME): the campaign's control leg is the same
 # e2e run with `GAME=$CONTROL_GAME`, and launching a second game here raced the first one's
 # socket and scratch.
@@ -358,4 +490,4 @@ if [ "${CONTROL:-0}" = 1 ]; then
     echo "== control: the unmodded game creates no backup =="
     run_control_scenario SimpleBackupsControl /tmp/opencode/simplebackups-e.sock
 fi
-echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); the save-overlap retry rule is pinned by the unit test (single player has no second save to overlap with)"
+echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); an archive carries its own manifest identity"

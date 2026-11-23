@@ -17,16 +17,22 @@ the game glue and `src/zip.rs` the archive writer. The launcher compiles it agai
 - **Backup:** a worker thread walks the world folder into `<world>/backups/<world>_<UTC>.zip.part`,
   publishes it by renaming, and skips `session.lock`, `.part`/`.tmp`, symlinks and the backups
   folder. Entries are `<world>/<relative path>`.
-- **Retention:** after a successful publish, only `<world>_*.zip` files are pruned oldest-first
-  until `keep` remain (`keep` is at least 1). Foreign files and `.part` files are untouched.
+- **Retention:** after a successful publish, the oldest archives this port wrote are pruned until
+  `keep` remain (`keep` is at least 1). An archive counts as this port's only when its own
+  `simplebackups.json` entry names this port and this world (archives from 0.2.0–0.2.2 are
+  recognised by their `<world>/…` + `<world>/level.dat` shape); a hand-made ZIP that merely
+  matches the `<world>_*.zip` name prefix is never deleted. Foreign files and `.part` files are
+  untouched.
 - **Disk cap:** after the same publish, the backup folder is measured and this world's oldest
-  archives are deleted until it is at most `max_disk_size` (default `"25 GB"`, binary units, upstream's
-  `maxDiskSize`), always keeping the newest archive. `/simplebackups status` reports
-  `disk=<size> cap=<size> over=<bool>`; foreign files count toward the folder size but are never
-  deleted.
+  **identified** archives are deleted until it is at most `max_disk_size` (default `"25 GB"`, binary
+  units, upstream's `maxDiskSize`), always keeping the newest archive. `/simplebackups status`
+  reports `disk=<size> cap=<size> over=<bool>`; foreign files count toward the folder size but are
+  never deleted. Same-second backups (`-1`, `-2`, … `-10`) are ordered by their numeric generation.
 - **A save that overlaps a copy:** the finished copy is thrown away and redone (`retry_on_save`,
-  up to two retries) instead of publishing a possibly half-replaced region file; when retries are
-  off, it is published and `/simplebackups status` reports `stale=true`.
+  up to two retries) instead of publishing a possibly half-replaced region file. When retries are
+  off, it is published and `/simplebackups status` reports `stale=true`; **both retention passes are
+  then skipped**, so the previous confirmed restore point is never deleted in favour of a copy a
+  save may have caught half-written (the folder may stay over the cap until the next good backup).
 - **Commands** (level 2): `/simplebackups backup [quiet]`, `/simplebackups status`,
   `/simplebackups list`. A manual backup ignores `enabled`.
 - **Config** `config/simplebackups.toml`: `enabled`, `interval_minutes`, `interval_ticks`, `keep`,
@@ -40,9 +46,8 @@ the game glue and `src/zip.rs` the archive writer. The launcher compiles it agai
   than deflated; `compression_level` is still parsed and reported.
 - Backups live in `<world>/backups` and are named in UTC (upstream used the working directory and
   local time).
-- The port is **local-only** until the maintainer approves publishing, and its outbound licence is
-  **Apache-2.0**, the same as upstream; see `LICENSE-NOTICE.md` and `notes.md` for the licence
-  provenance, the gaps and the verification ladder.
+- The port is published as **Apache-2.0**, the same as upstream; see `LICENSE-NOTICE.md` and
+  `notes.md` for the licence provenance, the gaps and the verification ladder.
 
 ## Building and checking
 

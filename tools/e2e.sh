@@ -27,6 +27,17 @@
 #   with `stale=true`; keep=1 and a 1 B cap must then delete nothing, leaving the
 #   clean restore point beside it. STALE_SELFTEST=1 asserts the pre-fix defect
 #   (retention ran) and always exits non-zero.
+# Scenario G: a marker-less archive needs an operator. A "manual export" — the world
+#   prefix, a 1999 name and the world's *own* files — is indistinguishable from a
+#   legacy archive by shape, so it survives both passes; after
+#   `/simplebackups adopt <file>` the next publish prunes it (the differential in the
+#   same folder).
+# Scenario H: two backups of one second. The only free suffix is a pruned one (the base
+#   name) and a new archive that reused it would sort behind `-42` and be deleted by
+#   the pass that follows. The new archive must be allocated above the highest suffix,
+#   and `keep`/the cap must never delete the archive just written.
+#   ADOPT_NEGATIVE=1 / SAME_SECOND_NEGATIVE=1 run one scene alone against a package that
+#   should fail it (the previous version), and exit non-zero either way.
 #
 # Since the SDK migration (2026-11-18) the mod is a flat `.hmod` the launcher
 # compiles into the game, so GAME must name a game the launcher built with it:
@@ -110,8 +121,19 @@ wait_for_removal() { # path
     done
     return 1
 }
+wait_for_other_zip() { # dir exclude-name
+    local dir=$1 exclude=$2 i
+    for i in $(seq 1 80); do
+        if find "$dir" -maxdepth 1 -name '*.zip' ! -name "$exclude" 2>/dev/null | grep -q .; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
 status_text() { ctl chat "/simplebackups status" >/dev/null; ctl wait 5 >/dev/null; ctl messages 20 | jq -r '.chat[]' | tr '\n' ' '; }
 list_text() { ctl chat "/simplebackups list" >/dev/null; ctl wait 5 >/dev/null; ctl messages 20 | jq -r '.chat[]' | tr '\n' ' '; }
+adopt_text() { ctl chat "/simplebackups adopt $1" >/dev/null; ctl wait 5 >/dev/null; ctl messages 20 | jq -r '.chat[]' | tr '\n' ' '; }
 check_zip() {
     python3 - "$1" "$2" <<'PY'
 import json, sys, zipfile
@@ -441,6 +463,180 @@ run_stale_retention_scenario() {
     rm -rf "$scratch"
 }
 
+# Scenario G: retention deletes a marker-less archive only after an operator adopts it.
+# The export is what a player makes by hand: the world prefix, an old name, and the world's
+# own files, so the world-zip shape cannot tell it apart. It must survive both passes until
+# `/simplebackups adopt <file>` — and then the next publish deletes it (the differential).
+run_adoption_scenario() {
+    local world=$1 sock=$2
+    local scratch
+    scratch=$(mktemp -d "${E2E_TMP:-/tmp/opencode}/simplebackups-home.XXXXXX")
+    write_config "${CONFIG_DIR:-$scratch/config}" false true "1 B" 1
+    launch "$sock" "$scratch" "$GAME" "$world"
+    local ctl
+    ctl() { "$CTL" --socket "$sock" "$@"; }
+    ctl wait-ready 120
+    ctl wait 10
+    local backups="$scratch/saves/$world/backups"
+    mkdir -p "$backups"
+    local export="$backups/${world}_1999-01-01_00-00-00.zip"
+    python3 - "$export" "$world" <<'PY'
+import sys, zipfile
+path, world = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(path, "w") as archive:
+    archive.writestr(f"{world}/level.dat", "a world")
+    archive.writestr(f"{world}/region/r.0.0.mca", "chunk")
+    archive.writestr(f"{world}/data/raids.dat", "\x00\x00")
+PY
+    echo "manual export: $export"
+
+    ctl chat "/simplebackups backup"
+    wait_for_other_zip "$backups" "$(basename "$export")" || fail "the first mod backup did not appear beside the manual export"
+    local first_mod
+    first_mod=$(find "$backups" -maxdepth 1 -name '*.zip' ! -name "$(basename "$export")" | head -1)
+    [ -n "$first_mod" ] || fail "the first mod backup was not found"
+    check_zip "$first_mod" "$world"
+    if [ ! -f "$export" ]; then
+        if [ "${ADOPT_NEGATIVE:-0}" = 1 ]; then
+            fail "ADOPT_NEGATIVE: the package deleted a manual export without an operator adoption — the scene fails on it, so it is alive"
+        fi
+        fail "a manual export was deleted by the first publish, before any operator adopted it"
+    fi
+
+    # keep=1 and a 1 B cap both run after this publish too; the export is the oldest file in
+    # the folder, so a shape rule (or a name rule) deletes it here as well.
+    ctl chat "/simplebackups backup"
+    wait_for_removal "$first_mod" || fail "the second backup did not publish (the older mod archive stayed)"
+    if [ ! -f "$export" ]; then
+        if [ "${ADOPT_NEGATIVE:-0}" = 1 ]; then
+            fail "ADOPT_NEGATIVE: the package deleted a manual export without an operator adoption — the scene fails on it, so it is alive"
+        fi
+        fail "a manual export was deleted without an operator adopting it"
+    fi
+    echo "manual export survived both passes: $export"
+
+    local reply status
+    reply=$(adopt_text "$(basename "$export")")
+    echo "adopt reply: $reply"
+    grep -qi 'adopted' <<<"$reply" || fail "adopt did not confirm the adoption: $reply"
+    status=$(status_text)
+    grep -q 'adopted=1' <<<"$status" || fail "status does not report one adopted archive: $status"
+
+    # The same folder, the same rules: the next publish prunes the adopted archive because it
+    # is now this world's.
+    ctl chat "/simplebackups backup"
+    if ! wait_for_removal "$export"; then
+        fail "an adopted archive was not pruned by the next publish"
+    fi
+    echo "adopted export pruned by the next publish (the differential)"
+    if [ "${ADOPT_NEGATIVE:-0}" = 1 ]; then
+        fail "ADOPT_NEGATIVE: the adoption scene passed on a package that should not have it"
+    fi
+    ctl quit >/dev/null 2>&1 || true
+    sleep 1
+    rm -rf "$scratch"
+}
+
+# Scenario H: two archives of the same second. `keep = 2` (H1) leaves both the seeded `-42`
+# and the new archive; the cap answers the same rule with `keep = 3` and a `1 B` cap (H2):
+# the older generations go and the archive just written stays.
+#
+# The seeds are copies of a real archive (they carry the marker), named for the second the
+# new backup is about to land in; the base name is deliberately free, which is the state a
+# pruned suffix leaves behind. The new archive must be `-43`, never the base name: as the
+# oldest of its second it would be deleted by the pass that runs immediately after.
+run_same_second_scenario() { # world sock keep cap
+    local world=$1 sock=$2 keep=$3 cap=$4
+    local scratch
+    scratch=$(mktemp -d "${E2E_TMP:-/tmp/opencode}/simplebackups-home.XXXXXX")
+    # No world save before the copy: the backup starts at the next tick, so seeding the
+    # current second still lands inside it.
+    write_config "${CONFIG_DIR:-$scratch/config}" false true "$cap" "$keep" false
+    launch "$sock" "$scratch" "$GAME" "$world"
+    local ctl
+    ctl() { "$CTL" --socket "$sock" "$@"; }
+    ctl wait-ready 120
+    ctl wait 10
+    local backups="$scratch/saves/$world/backups"
+    ctl chat "/simplebackups backup"
+    wait_for_zip "$backups" 1 || fail "the source backup did not appear"
+    local source
+    source=$(first_zip "$backups")
+    check_zip "$source" "$world"
+    # The bytes are kept outside the backup folder: retention deletes the archive itself, so a
+    # retry cannot copy from it.
+    cp -p "$source" "$scratch/seed-source.zip"
+
+    local attempt=0 stem="" new_name=""
+    while [ "$attempt" -lt 6 ]; do
+        attempt=$((attempt + 1))
+        stem=$(date -u +"${world}_%Y-%m-%d_%H-%M-%S")
+        find "$backups" -maxdepth 1 -name '*.zip' -delete
+        cp -p "$scratch/seed-source.zip" "$backups/${stem}-41.zip"
+        cp -p "$scratch/seed-source.zip" "$backups/${stem}-42.zip"
+        find "$backups" -maxdepth 1 -name '*.zip' -printf '%f\n' | sort > "$scratch/before.txt"
+        ctl chat "/simplebackups backup"
+        new_name=""
+        local i
+        for i in $(seq 1 120); do
+            find "$backups" -maxdepth 1 -name '*.zip' -printf '%f\n' | sort > "$scratch/now.txt"
+            new_name=$(comm -13 "$scratch/before.txt" "$scratch/now.txt" | head -1)
+            [ -n "$new_name" ] && break
+            sleep 0.25
+        done
+        case "$new_name" in
+            "$stem"*) break ;;   # landed in the seeded second
+            *) new_name="" ;;    # another second: seed again and retry
+        esac
+    done
+    if [ -z "$new_name" ]; then
+        # No new name survived. If the port's own `status` names an archive of the seeded second,
+        # the publish wrote it and deleted it in the same pass — the suffix reuse.
+        local last
+        last=$(status_text | sed -n 's/.*last=\([^ ][^ ]*\).*/\1/p')
+        if [ -n "$last" ] && [ "${last#"$stem"}" != "$last" ]; then
+            if [ "${SAME_SECOND_NEGATIVE:-0}" = 1 ]; then
+                fail "SAME_SECOND_NEGATIVE: the publish wrote $last and deleted it in the same pass (the reused base suffix) — the scene fails on it, so it is alive"
+            fi
+            fail "the publish wrote $last and then deleted it: the new archive reused a pruned suffix"
+        fi
+        fail "no backup landed in the seeded second in six attempts"
+    fi
+    echo "seeded second: ${stem} (attempts: $attempt)"
+    echo "new archive: $new_name"
+
+    local status
+    status=$(status_text)
+    echo "status: $status"
+    local expected="${stem}-43.zip"
+    if [ "$new_name" != "$expected" ]; then
+        if [ "${SAME_SECOND_NEGATIVE:-0}" = 1 ]; then
+            fail "SAME_SECOND_NEGATIVE: the package reused a pruned suffix ($new_name instead of $expected) — the scene fails on it, so it is alive"
+        fi
+        fail "the new archive reused a pruned suffix ($new_name), so it sorts behind an older one of the same second"
+    fi
+    [ -f "$backups/$expected" ] || fail "the archive just written ($expected) does not exist"
+    grep -q "last=$expected" <<<"$status" || fail "status does not name the newest archive: $status"
+
+    if [ "$cap" = "1 B" ]; then
+        [ -f "$backups/${stem}-42.zip" ] && fail "the cap kept the older generation -42"
+        [ -f "$backups/${stem}-41.zip" ] && fail "the cap kept the older generation -41"
+        grep -q 'over=true' <<<"$status" || fail "a 1 B cap that kept one archive must report over=true: $status"
+        echo "the cap removed the older generations and never the archive just written"
+    else
+        [ -f "$backups/${stem}-42.zip" ] || fail "keep=2 deleted the second archive of the same second"
+        [ -f "$backups/${stem}-41.zip" ] && fail "keep=2 kept three archives of the same second"
+        echo "both archives of the same second survive, -42 then -43"
+    fi
+    if [ "${SAME_SECOND_NEGATIVE:-0}" = 1 ]; then
+        fail "SAME_SECOND_NEGATIVE: the same-second scene passed on a package that should not have it"
+    fi
+    ctl quit >/dev/null 2>&1 || true
+    sleep 1
+    rm -rf "$scratch"
+}
+
+
 # The control leg: the same scene on a game without the mod creates no backup at
 # all, so "a zip appeared" is the mod's doing and not the engine's.
 run_control_scenario() {
@@ -467,6 +663,16 @@ if [ "${STALE_SELFTEST:-0}" = 1 ]; then
     run_stale_retention_scenario SimpleBackupsStaleSelf /tmp/opencode/simplebackups-stale-self.sock
     fail "STALE_SELFTEST inconclusive: the stale scene returned without its assertion"
 fi
+if [ "${ADOPT_NEGATIVE:-0}" = 1 ]; then
+    echo "== scenario G negative: a manual export must need an operator (the previous package fails this) =="
+    run_adoption_scenario SimpleBackupsAdoptNeg /tmp/opencode/simplebackups-adopt-neg.sock
+    fail "ADOPT_NEGATIVE inconclusive: the adoption scene passed on a package that should fail it"
+fi
+if [ "${SAME_SECOND_NEGATIVE:-0}" = 1 ]; then
+    echo "== scenario H negative: the same-second allocation (the previous package fails this) =="
+    run_same_second_scenario SimpleBackupsSameSecondNeg /tmp/opencode/simplebackups-h-neg.sock 2 "1 TB"
+    fail "SAME_SECOND_NEGATIVE inconclusive: the same-second scene passed on a package that should fail it"
+fi
 echo "== scenario A: scheduled backup + keep=1 =="
 run_scenario true SimpleBackupsE2E /tmp/opencode/simplebackups-a.sock
 echo "== scenario B: enabled=false counterfactual + manual =="
@@ -483,6 +689,12 @@ echo "== scenario E: a hand-made ZIP named like a backup survives retention =="
 run_foreign_scenario SimpleBackupsForeign /tmp/opencode/simplebackups-h.sock
 echo "== scenario F: a stale copy skips both retention passes =="
 run_stale_retention_scenario SimpleBackupsStale /tmp/opencode/simplebackups-i.sock
+echo "== scenario G: a manual export is deletable only after an operator adopts it =="
+run_adoption_scenario SimpleBackupsAdopt /tmp/opencode/simplebackups-j.sock
+echo "== scenario H: two archives of the same second, allocated above the highest suffix =="
+run_same_second_scenario SimpleBackupsSameSecond /tmp/opencode/simplebackups-k.sock 2 "1 TB"
+echo "== scenario H2: the cap never deletes the archive just written =="
+run_same_second_scenario SimpleBackupsSameSecondCap /tmp/opencode/simplebackups-l.sock 3 "1 B"
 # The control is opt-in (CONTROL=1 with CONTROL_GAME): the campaign's control leg is the same
 # e2e run with `GAME=$CONTROL_GAME`, and launching a second game here raced the first one's
 # socket and scratch.
@@ -490,4 +702,4 @@ if [ "${CONTROL:-0}" = 1 ]; then
     echo "== control: the unmodded game creates no backup =="
     run_control_scenario SimpleBackupsControl /tmp/opencode/simplebackups-e.sock
 fi
-echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); an archive carries its own manifest identity"
+echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); a manual export with the world's own shape survives until an operator adopts it and is pruned after (scenario G); a backup allocated in a second that already has generations becomes the highest suffix and survives keep and the cap (scenario H, H2); an archive carries its own manifest identity"

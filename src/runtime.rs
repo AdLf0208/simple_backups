@@ -249,16 +249,36 @@ pub fn backup_file_stem(world: &str, unix_secs: i64) -> String {
     format!("{world}_{year:04}-{month:02}-{day:02}_{hour:02}-{minute:02}-{second:02}")
 }
 
-/// The next free `<stem>.zip`, with `-1`, `-2`… on a collision.
+/// The next free name for this second: the base `<stem>.zip` when nothing of that second
+/// exists, else **one above the highest suffix present** (`-1`, `-2` …).
+///
+/// Taking the lowest free suffix instead would reuse a number retention pruned and put the
+/// new archive *behind* an older one of the same second — the very pass that runs after the
+/// publish would then delete the backup it just wrote.
 pub fn backup_file_name(world: &str, unix_secs: i64, taken: &[String]) -> String {
     let stem = backup_file_stem(world, unix_secs);
-    let mut name = format!("{stem}.zip");
-    let mut suffix = 0;
-    while taken.iter().any(|candidate| candidate == &name) {
-        suffix += 1;
-        name = format!("{stem}-{suffix}.zip");
+    let highest = taken
+        .iter()
+        .filter_map(|candidate| generation_of(candidate, &stem))
+        .max();
+    match highest {
+        Some(generation) => format!("{stem}-{}.zip", generation.saturating_add(1)),
+        None => format!("{stem}.zip"),
     }
-    name
+}
+
+/// The generation a name carries for `stem`: `0` for `<stem>.zip`, `n` for `<stem>-n.zip`,
+/// and `None` for any other name (a `.part`, another second, another world, a foreign file).
+fn generation_of(candidate: &str, stem: &str) -> Option<u64> {
+    let rest = candidate.strip_prefix(stem)?.strip_suffix(".zip")?;
+    if rest.is_empty() {
+        return Some(0);
+    }
+    let digits = rest.strip_prefix('-')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 fn utc_parts(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
@@ -306,6 +326,10 @@ pub struct Archive {
 
 /// Parse `<world>_<YYYY-MM-DD_HH-MM-SS>[-<generation>].zip`. The generation is numeric, so
 /// `-10` follows `-9` and the base name is generation 0.
+///
+/// The name comes from the filesystem, so it is untrusted: the stamp is taken with a
+/// **char-boundary-checked** slice (`str::get`), not `split_at(19)`, because a name with a
+/// multibyte character at byte 19 would otherwise panic on the server tick.
 #[must_use]
 pub fn parse_archive(name: &str, world: &str, bytes: u64) -> Option<Archive> {
     let rest = name
@@ -315,7 +339,8 @@ pub fn parse_archive(name: &str, world: &str, bytes: u64) -> Option<Archive> {
     if rest.len() < 19 {
         return None;
     }
-    let (stamp, suffix) = rest.split_at(19);
+    let stamp = rest.get(..19)?;
+    let suffix = rest.get(19..)?;
     if !is_stamp(stamp) {
         return None;
     }
@@ -423,17 +448,77 @@ fn chronological(archives: &[Archive]) -> Vec<&Archive> {
 }
 
 /// Archives the `keep` rule removes, oldest first. The caller passes only archives it has
-/// identified as this port's, and the newest one always stays (the confirmed restore point).
+/// identified as this port's, and `protected` — the archive the publish just wrote — is never
+/// among them: reusing a pruned suffix or a clock that stepped back can leave the new archive
+/// behind an older one, and deleting it would lose the backup this run just made.
 #[must_use]
-pub fn prune(archives: &[Archive], keep: usize) -> Vec<String> {
+pub fn prune(archives: &[Archive], keep: usize, protected: &str) -> Vec<String> {
     let keep = keep.max(1);
     let ordered = chronological(archives);
-    let remove = ordered.len().saturating_sub(keep);
-    ordered
-        .into_iter()
-        .take(remove)
-        .map(|archive| archive.name.clone())
+    let mut remaining = ordered.len();
+    let mut remove = Vec::new();
+    for archive in ordered {
+        if remaining <= keep {
+            break;
+        }
+        if archive.name == protected {
+            continue;
+        }
+        remove.push(archive.name.clone());
+        remaining -= 1;
+    }
+    remove
+}
+
+/// The journal an operator's adoptions are recorded in, inside the backup folder. It is not a
+/// `.zip`, so `/simplebackups list` and retention never mistake it for an archive.
+pub const ADOPTION_FILE: &str = "simplebackups-adopted.txt";
+
+/// One archive an operator adopted: the file name and the size it had when it was adopted.
+///
+/// The size is recorded so that replacing the file (a different archive under the same name)
+/// drops the adoption: retention then stops touching it again. A name alone would let anything
+/// that later lands on that path be deleted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Adoption {
+    pub name: String,
+    pub bytes: u64,
+}
+
+/// Read the adoption journal: one `<bytes>\t<name>` line per adopted archive.
+#[must_use]
+pub fn parse_adoptions(text: &str) -> Vec<Adoption> {
+    text.lines()
+        .filter_map(|line| {
+            let (bytes, name) = line.split_once('\t')?;
+            let bytes = bytes.trim().parse().ok()?;
+            let name = name.trim_end_matches('\r');
+            if name.is_empty() || name.contains('\t') {
+                return None;
+            }
+            Some(Adoption {
+                name: name.to_owned(),
+                bytes,
+            })
+        })
         .collect()
+}
+
+/// The journal as it is written back: stable order, one line per archive.
+#[must_use]
+pub fn format_adoptions(adoptions: &[Adoption]) -> String {
+    adoptions
+        .iter()
+        .map(|adoption| format!("{}\t{}\n", adoption.bytes, adoption.name))
+        .collect()
+}
+
+/// Whether this exact file (name and size) is one an operator adopted.
+#[must_use]
+pub fn is_adopted(adoptions: &[Adoption], name: &str, bytes: u64) -> bool {
+    adoptions
+        .iter()
+        .any(|adoption| adoption.name == name && adoption.bytes == bytes)
 }
 
 fn normalise(relative: &str) -> Option<String> {
@@ -563,18 +648,29 @@ pub struct CapPlan {
 }
 
 /// Plan the archives the cap removes: the whole folder counts toward the cap, only archives the
-/// caller identified as this port's are ever deleted, oldest first, and never the newest one.
+/// caller identified as this port's are ever deleted, oldest first, never the last one left and
+/// never `protected` (the archive this publish just wrote).
 #[must_use]
-pub fn cap_removals(entries: &[(String, u64)], archives: &[Archive], cap: u64) -> CapPlan {
+pub fn cap_removals(
+    entries: &[(String, u64)],
+    archives: &[Archive],
+    cap: u64,
+    protected: &str,
+) -> CapPlan {
     let mut remaining_bytes: u64 = entries.iter().map(|(_, size)| *size).sum();
     let ordered = chronological(archives);
     let mut remove = Vec::new();
+    let mut remaining = ordered.len();
     let mut index = 0;
-    while remaining_bytes > cap && ordered.len().saturating_sub(index) > 1 {
+    while remaining_bytes > cap && remaining > 1 && index < ordered.len() {
         let archive = ordered[index];
+        index += 1;
+        if archive.name == protected {
+            continue;
+        }
         remove.push(archive.name.clone());
         remaining_bytes = remaining_bytes.saturating_sub(archive.bytes);
-        index += 1;
+        remaining -= 1;
     }
     CapPlan {
         remove,
@@ -687,6 +783,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_pruned_suffix_is_never_reused_for_a_new_backup() {
+        // Retention pruned generations 0..=4 of this second, so only `-5` is left and the
+        // base name is free. Reusing it would make the new backup the *oldest* of its
+        // second, and the pass that runs right after would delete it as the oldest.
+        let stem = "W_2026-11-03_12-34-56";
+        let taken = vec![format!("{stem}-5.zip")];
+        assert_eq!(
+            backup_file_name("W", 1_793_709_296, &taken),
+            format!("{stem}-6.zip"),
+            "the next generation is above the highest suffix, not the lowest free one"
+        );
+        // A gap below the highest suffix is not free either: `-1` would sort before `-3`.
+        let taken = vec![format!("{stem}.zip"), format!("{stem}-3.zip")];
+        assert_eq!(
+            backup_file_name("W", 1_793_709_296, &taken),
+            format!("{stem}-4.zip")
+        );
+        // Only a folder with no archive of this second starts at the base name.
+        assert_eq!(
+            backup_file_name("W", 1_793_709_296, &[]),
+            format!("{stem}.zip")
+        );
+    }
+
+    #[test]
+    fn a_name_with_a_multibyte_character_at_the_stamp_boundary_is_refused() {
+        // 18 ASCII bytes, then a two-byte character: byte 19 is inside it, so slicing the
+        // stamp by bytes panics — on the server tick, which is a crash, not a warning.
+        assert!(
+            parse_archive("W_2026-01-01_00-00-0é.zip", "W", 1).is_none(),
+            "a malformed name is refused, never sliced at a non-character boundary"
+        );
+        assert!(parse_archive("W_é026-01-01_00-00-00.zip", "W", 1).is_none());
+        assert!(parse_archive("W_2026-01-01_00-00-00é.zip", "W", 1).is_none());
+        // The same name in ASCII still parses, so the check is about the boundary only.
+        assert!(parse_archive("W_2026-01-01_00-00-00.zip", "W", 1).is_some());
+    }
+
     /// The archives named, as the glue builds them after it has identified each one.
     fn archives(names: &[&str]) -> Vec<Archive> {
         names
@@ -707,9 +842,9 @@ mod tests {
             "W_2026-01-01_00-00-03.zip",
         ];
         let candidates = archives(&names);
-        assert_eq!(prune(&candidates, 2), [names[0]]);
-        assert_eq!(prune(&candidates, 1), [names[0], names[1]]);
-        assert!(prune(&candidates, 3).is_empty());
+        assert_eq!(prune(&candidates, 2, ""), [names[0]]);
+        assert_eq!(prune(&candidates, 1, ""), [names[0], names[1]]);
+        assert!(prune(&candidates, 3, "").is_empty());
     }
 
     #[test]
@@ -898,14 +1033,14 @@ mod tests {
             archive("W_2026-01-01_00-00-02.zip", 600),
             archive("W_2026-01-01_00-00-03.zip", 600),
         ];
-        let plan = cap_removals(&entries, &candidates, 500);
+        let plan = cap_removals(&entries, &candidates, 500, "");
         assert_eq!(
             plan.remove,
             ["W_2026-01-01_00-00-01.zip", "W_2026-01-01_00-00-02.zip"]
         );
         assert_eq!(plan.remaining_bytes, 600, "the newest archive stays");
         assert!(plan.over, "one archive is still bigger than the cap");
-        let plan = cap_removals(&entries, &candidates, 2_000);
+        let plan = cap_removals(&entries, &candidates, 2_000, "");
         assert!(plan.remove.is_empty());
         assert_eq!(plan.remaining_bytes, 1_800);
         assert!(!plan.over);
@@ -926,7 +1061,7 @@ mod tests {
             archive("W_2026-01-01_00-00-01.zip", 400),
             archive("W_2026-01-01_00-00-02.zip", 400),
         ];
-        let plan = cap_removals(&entries, &candidates, 1_000);
+        let plan = cap_removals(&entries, &candidates, 1_000, "");
         assert_eq!(
             plan.remove,
             ["W_2026-01-01_00-00-01.zip"],
@@ -965,7 +1100,7 @@ mod tests {
             .iter()
             .map(|name| parse_archive(name, "W", 1).expect("a backup name"))
             .collect();
-        let removed = prune(&candidates, 2);
+        let removed = prune(&candidates, 2, "");
         assert_eq!(
             removed,
             names[..9].to_vec(),
@@ -989,7 +1124,7 @@ mod tests {
             .iter()
             .map(|name| parse_archive(name, "W", 1_000).expect("a backup name"))
             .collect();
-        let plan = cap_removals(&entries, &candidates, 2_000);
+        let plan = cap_removals(&entries, &candidates, 2_000, "");
         assert_eq!(
             plan.remove,
             names[..9].to_vec(),
@@ -997,6 +1132,61 @@ mod tests {
         );
         assert_eq!(plan.remaining_bytes, 2_000);
         assert!(!plan.over);
+    }
+
+    #[test]
+    fn neither_pass_removes_the_archive_just_published() {
+        // The archive just written can sort *oldest*: a reused pruned suffix, or a clock that
+        // stepped back. Deleting it would lose the backup this run just made, so both passes
+        // take it out of their candidates, and the cap may leave the folder over its limit
+        // rather than delete it.
+        let names = [
+            "W_2026-11-03_12-34-56.zip",
+            "W_2026-11-03_12-34-56-1.zip",
+            "W_2026-11-03_12-34-56-2.zip",
+        ];
+        let candidates = archives(&names);
+        let protected = names[0];
+        assert_eq!(
+            prune(&candidates, 1, protected),
+            [names[1].to_owned(), names[2].to_owned()],
+            "keep removes the others, never the archive just written"
+        );
+        let entries: Vec<(String, u64)> =
+            names.iter().map(|name| ((*name).to_owned(), 100)).collect();
+        let plan = cap_removals(&entries, &candidates, 50, protected);
+        assert_eq!(plan.remove, [names[1].to_owned(), names[2].to_owned()]);
+        assert!(
+            plan.over,
+            "the protected archive alone is over the cap and still stays"
+        );
+        // The same set without protection shows what would be lost: the oldest goes first.
+        assert_eq!(
+            prune(&candidates, 1, names[2]),
+            [names[0].to_owned(), names[1].to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_adoption_journal_round_trips_and_matches_the_size() {
+        let adoptions = vec![
+            Adoption {
+                name: "W_2026-01-01_00-00-00.zip".to_owned(),
+                bytes: 1_234,
+            },
+            Adoption {
+                name: "W_2026-01-02_00-00-00.zip".to_owned(),
+                bytes: 42,
+            },
+        ];
+        assert_eq!(parse_adoptions(&format_adoptions(&adoptions)), adoptions);
+        assert!(is_adopted(&adoptions, "W_2026-01-01_00-00-00.zip", 1_234));
+        assert!(
+            !is_adopted(&adoptions, "W_2026-01-01_00-00-00.zip", 1_235),
+            "a file replaced since the adoption is not the adopted archive"
+        );
+        assert!(!is_adopted(&adoptions, "W_2026-01-03_00-00-00.zip", 1_234));
+        assert!(parse_adoptions("garbage\n\n").is_empty());
     }
 
     #[test]

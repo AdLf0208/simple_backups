@@ -4,30 +4,31 @@
 > pre-SDK bundle (`compatibility.json`, `tools/horizon.py`, the mixin plan), which no longer loads on
 > launcher ≥ 0.2.70.
 
-## Current: SDK package 0.2.3 (2026-11-23, pin `0a875da`)
+## Current: SDK package 0.2.4 (2026-11-23, pin `0a875da`)
 
-The ladder and its logs live in [`notes.md`](notes.md) under *Slice 3 (0.2.3)* and
+The ladder and its logs live in [`notes.md`](notes.md) under *Slice 4 (0.2.4)* and
 `../_shared/evidence/simplebackups/`:
 
 | Check | Result | Log |
 |---|---|---|
-| `cargo test --offline` | 46 passed, 0 failed (28 `runtime`, 7 `support`, 11 `zip`) | `sdk-test.log` |
-| red run before the fix | 36 passed, 4 failed (stale skip, unmanaged ZIP, two same-second orders) | `sdk-test-red.log` |
+| `cargo test --offline` | 53 passed, 0 failed (32 `runtime`, 10 `support`, 11 `zip`) | `sdk-test.log` |
+| red run before the fixes | 46 passed, 4 failed (multibyte name panic, suffix reuse, unadopted export, archive just written) | `sdk-test-red.log` |
+| red run before the adopt command | 51 passed, 2 failed (`adopt` stubbed, marker-less shape still an identity) | `sdk-test-red-adopt.log` |
 | `cargo clippy --offline --all-targets -- -D warnings` | exit 0, 0 warnings | `sdk-clippy.log` |
 | `cargo fmt --check` | clean | `sdk-fmt.log` |
 | `rm -f Cargo.lock && cargo horizon-mod build` | `Built ./target/horizon-mod/simplebackups.hmod`, exit 0 | `sdk-build.log` |
-| second build + `cmp` | byte-identical, 45,307 B, sha256 `4c9061c0…592a` | `sdk-sha256-second.txt` |
-| `cargo horizon-mod check` | format `native-1/0a875da…/e59da90…`, for 26.3, 45,307 bytes, exit 0 | `sdk-check.log` |
+| second build + `cmp` | byte-identical, 50,023 B, sha256 `f7a25eae…733c5` | `sdk-sha256-second.txt` |
+| `cargo horizon-mod check` | format `native-1/0a875da…/e59da90…`, for 26.3, 50,023 bytes, exit 0 | `sdk-check.log` |
 | `fits --build 0a875da…` | `0a875da  made for`, exit 0 | `sdk-fits.log` |
 | `fits --build 0b14f8a…` | `0b14f8a  fits`, exit 0 (the real gate) | `sdk-fits-other.log` |
 | `verify-sdk-package.py simplebackups` | 1/1, `package matches the tree` | — |
 | `unzip -l` | 10 entries, no `Cargo.lock` | `sdk-entries.log` |
-| in game | `PASS` + `EXIT:0`; control `EXIT:1`; `SELFTEST=1` `EXIT:1`; `STALE_SELFTEST=1` `EXIT:1` | `../simplebackups-e2e/e2e-launcher*.log` |
-| e2e log gate | `logs=4 ok=4 missing-exit=0 bad-exit=0` (`--strict`) | — |
+| in game | `PASS` + `EXIT:0` (scenarios A–F, G, H, H2); control `EXIT:1`; `SELFTEST=1` `EXIT:1`; `STALE_SELFTEST=1` `EXIT:1`; the 0.2.3 package fails G and H (`e2e-launcher-{adopt,same-second}-negative.log`, `EXIT:1`) | `../simplebackups-e2e/e2e-launcher*.log` |
+| e2e log gate | `logs=6 ok=6 missing-exit=0 bad-exit=0` (`--strict`) | — |
 
-The 0.2.2 package was validated the same way at pin `0a875da`; its record is the *Slice 2* section
-of `notes.md`. The 0.2.1 package was validated at pin `0b14f8a`; its e2e logs are in
-`../_shared/evidence/simplebackups-e2e/retired-0.2.1/`.
+The 0.2.3 package was validated the same way at pin `0a875da`; its record is the *Slice 3* section
+of `notes.md`. The 0.2.2 package's is *Slice 2*; the 0.2.1 package was validated at pin `0b14f8a`
+(its e2e logs are in `../_shared/evidence/simplebackups-e2e/retired-0.2.1/`).
 
 ## Historical — 0.1.0 `.hnmod`
 

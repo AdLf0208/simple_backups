@@ -13,6 +13,11 @@ default) prunes the oldest archives after a good backup, repinned to Horizon `0a
 **0.2.3** (2026-11-23) is the review fix for the cap: retention now deletes only archives the port
 can identify as its own (an archive manifest), skips both passes after a stale copy, and orders
 same-second generations numerically; 46 tests, scenarios E/F and the stale selftest in game.
+**0.2.4** (2026-11-23) is review round two: a marker-less archive is deletable only after an
+operator's `/simplebackups adopt <file>`, a new backup is allocated above the highest existing
+same-second suffix (and never deleted by the pass that follows), and a malformed name can no longer
+panic the server tick; 53 tests, scenarios G/H/H2 in game, and the pre-fix behaviour kept as
+`negative` legs.
 
 **Class + tier** (from `ports/ledger.csv`, per `horizon/docs/modpacks.md`):
 **server-only / logic**. The approach is the **logic shape**: a pure policy
@@ -199,11 +204,13 @@ phase that asserts it.
 | save before copy | tested | every scenario: `LevelRef::request_save` → `world_saved` → the copy starts (`status` `saves=` grows) |
 | zip of the world folder | tested | scenario A/B/D: `zipfile.testzip()` CRC pass, `level.dat` inside, no `session.lock`, no `backups/` subtree |
 | retention (`keep`) | tested | scenario A: `keep=1` leaves exactly one archive; scenario E: the older **mod-made** archive is removed while a hand-made ZIP with the same prefix stays |
-| disk cap (`max_disk_size`) | tested | scenario D: `1 B` leaves the newer archive and `over=true`; `1 TB` counterfactual leaves both and `over=false`; scenario F: the cap deletes nothing after a stale copy |
+| disk cap (`max_disk_size`) | tested | scenario D: `1 B` leaves the newer archive and `over=true`; `1 TB` counterfactual leaves both and `over=false`; scenario F: the cap deletes nothing after a stale copy; scenario H2: the cap removes the older same-second generations and never the archive just written |
 | archive identity (own manifest) | tested | `support::tests::an_archive_identifies_itself_not_by_its_name`; every `check_zip` call parses `simplebackups.json` and asserts `format` + `world` |
+| legacy archive adoption (`/simplebackups adopt`) | tested | scenario G: a hand-made export with the world's own shape survives both passes, `adopt` answers `adopted`, `status` reports `adopted=1`, and the next publish prunes it; `support::tests::an_adopted_legacy_zip_becomes_deletable`; the 0.2.3 package deletes the export without any adoption (`e2e-launcher-adopt-negative.log`, `EXIT:1`) |
 | stale copy skips retention | tested | scenario F: `stale=true` with `keep=1` and a `1 B` cap leaves both archives and `over=true`; `STALE_SELFTEST=1` asserts the pre-fix defect and exits 1 |
-| same-second generations | tested | `runtime::tests::{same_second_backups_sort_by_generation_not_as_text,the_cap_also_orders_same_second_generations_numerically}` |
-| commands `backup` / `status` / `list` | tested | `ctl chat "/simplebackups backup"` and `status` in every scenario, `list` in scenario D: the reply names every archive in the folder, and after a `1 B` cap it no longer names the deleted one |
+| same-second generations | tested | `runtime::tests::{same_second_backups_sort_by_generation_not_as_text,the_cap_also_orders_same_second_generations_numerically,a_pruned_suffix_is_never_reused_for_a_new_backup}`; scenario H: a backup in a second that already has `-41`/`-42` becomes `-43` and both `-42`/`-43` survive `keep=2`; H2: the cap keeps only `-43`. The 0.2.3 package writes the base name and deletes it in the same pass (`e2e-launcher-same-second-negative.log`, `EXIT:1`) |
+| malformed archive name | tested | `runtime::tests::a_name_with_a_multibyte_character_at_the_stamp_boundary_is_refused`: a two-byte character at byte 19 is refused, not sliced (the pre-fix `split_at(19)` panicked) |
+| commands `backup` / `status` / `list` / `adopt` | tested | `ctl chat "/simplebackups backup"` and `status` in every scenario, `list` in scenario D: the reply names every archive in the folder, and after a `1 B` cap it no longer names the deleted one; `adopt` in scenario G (confirmed reply, `adopted=1`, and a refusal for a name that is not this world's) |
 | save-overlap retry (`retry_on_save`) | tested | unit test `should_retry`; scenario F forces a real overlap with `ctl save` during a 256 MiB copy (`stale=true`, `saves=6`); scenario C's pause/resume still prints `SKIP` (that path cannot make a save) |
 | `pause` / `unpause` | not ported | gap (commands are `backup`, `status`, `list` only) |
 | empty-server policy (`noPlayerBackups`) | not ported | gap; needs a player-presence API and a way to empty the server headless |
@@ -337,7 +344,172 @@ Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven
 > game by scenario E (hand-made archive survives, older mod archive removed) and scenario F (stale copy
 > leaves the clean one).
 
+## Slice 4 (0.2.4, 2026-11-23) — review round two: adoption, allocation, a checked name
+
+**Review.** `NikitaMGrimm` reviewed 0.2.3 and accepted the stale-copy fix; four findings remained,
+three of them code:
+
+1. *"Require an operator to adopt legacy ZIPs before retention can delete them. A manual export can
+   have the expected filename and contain the same world files."* The 0.2.3 fallback recognised a
+   marker-less archive by its `<world>/…` + `<world>/level.dat` shape — which a hand-made export
+   has by construction.
+2. *"Allocate a same-second generation above the highest existing suffix, and protect the newly
+   published clean archive in both retention passes. Reusing a pruned suffix can make the new
+   backup sort behind an older one and be deleted immediately."* 0.2.3 took the **lowest free**
+   suffix, so a folder holding only `-3`…`-5` made the new backup `-0`: the oldest of its second,
+   and the pass that runs right after deleted it.
+3. *"Use a checked split or validate the timestamp before slicing it. A malformed ZIP filename with
+   a multibyte character at byte 19 can panic on the server tick."* `parse_archive` used
+   `rest.split_at(19)` on an untrusted name: `byte index 19 is not a char boundary` is a panic, and
+   a panic in `server_tick` is a crash.
+4. (The fourth was the accepted stale-copy fix; nothing to change there.)
+
+**Gap lines.** *Gaps / deviations*: "…only archives the port can identify as its own (a manifest
+since 0.2.3; the world-zip shape for 0.2.0–0.2.2)" — a shape is not an identity; and the coverage
+row "same-second generations | tested" named ordering but not allocation, so the rule that keeps a
+new backup out of the removal set did not exist.
+
+**What changed.**
+
+- **`/simplebackups adopt <file>`** (level 2, the smallest workable operator action). It refuses
+  anything but a bare file name inside the backup folder, a name that is not
+  `<world>_<UTC>[-<generation>].zip` for this world, a file that is not a regular file, and a ZIP
+  that is not world-shaped; it says so when the archive already carries the marker. It records
+  `<bytes>\t<name>` in `simplebackups-adopted.txt` in the backup folder (written to a staging file
+  and renamed), so **the adoption binds to the exact file**: replacing the archive under that name
+  drops it out of retention again. `retainable` is now "the port's marker, or an adopted name +
+  size **and** the world shape". `/simplebackups status` reports `adopted=<n>` on the disk line
+  (the older `disk=/cap=/over=` assertions still match).
+- **Allocation** (`backup_file_name`): the base name only when nothing of that second exists, else
+  `max(generation) + 1` — `-6` after a surviving `-5`, `-4` when only the base and `-3` are there.
+- **Protection**: `prune(archives, keep, protected)` and `cap_removals(entries, archives, cap,
+  protected)` take the name the publish just wrote and never remove it; the cap may leave the
+  folder over its limit rather than delete the backup that run just made.
+- **`parse_archive`** takes the stamp with `str::get(..19)` / `str::get(19..)`: a non-boundary
+  slice returns `None` instead of panicking.
+
+**Red → green (two runs, verbatim from `sdk-test-red.log` / `sdk-test-red-adopt.log`).** The four
+rules were written as failing tests first; 46 passed, 4 failed on the 0.2.3 code:
+
+```
+---- runtime::tests::a_name_with_a_multibyte_character_at_the_stamp_boundary_is_refused stdout ----
+thread 'runtime::tests::a_name_with_a_multibyte_character_at_the_stamp_boundary_is_refused' (445934) panicked at /rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/core/src/str/mod.rs:849:21:
+end byte index 19 is not a char boundary; it is inside 'é' (bytes 18..20) of `2026-01-01_00-00-0é`
+
+---- runtime::tests::a_pruned_suffix_is_never_reused_for_a_new_backup stdout ----
+assertion `left == right` failed: the next generation is above the highest suffix, not the lowest free one
+  left: "W_2026-11-03_12-34-56.zip"
+ right: "W_2026-11-03_12-34-56-6.zip"
+
+---- support::tests::a_manual_export_with_the_world_shape_needs_an_operator_to_become_deletable stdout ----
+an archive no operator adopted must survive both retention passes, whatever its shape
+
+---- support::tests::the_archive_just_written_survives_both_retention_passes stdout ----
+the archive just written is never deleted by either pass (keep removed ["World_2026-01-01_00-00-00.zip"], cap removed [])
+
+test result: FAILED. 46 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+```
+
+The adopt command had its own red against the code that already had the other three fixes, with
+`adopt_archive` stubbed (`Err("adopt is not implemented yet")`):
+
+```
+---- support::tests::an_adopted_legacy_zip_becomes_deletable stdout ----
+adopt the export: "adopt is not implemented yet"
+
+---- support::tests::an_archive_identifies_itself_not_by_its_name stdout ----
+pre-marker archives are recognised by their world-zip shape
+
+test result: FAILED. 51 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+```
+
+Green: **53 passed, 0 failed** (32 `runtime`, 10 `support`, 11 `zip`) — `sdk-test.log`, clippy
+`-D warnings` 0 warnings (`sdk-clippy.log`), `fmt --check` clean (`sdk-fmt.log`).
+
+**In game (launcher build `native-0a875da-b49c3e979166`, `libsimplebackups.so` identity
+`… simplebackups 0.2.4 1.99.1`; every packed file is the tree's bytes —
+`../_shared/evidence/simplebackups-e2e/build-record.txt`).**
+
+Scenario G — a manual export (the world prefix, a 1999 name, and `World/level.dat`,
+`World/region/r.0.0.mca`, `World/data/raids.dat` inside) beside two mod backups, with `keep=1` and
+a `1 B` cap:
+
+```
+manual export: …/SimpleBackupsAdopt_1999-01-01_00-00-00.zip
+manual export survived both passes: …/SimpleBackupsAdopt_1999-01-01_00-00-00.zip
+adopt reply: adopted SimpleBackupsAdopt_1999-01-01_00-00-00.zip (456 B); retention may now delete it
+adopted export pruned by the next publish (the differential)
+```
+
+Scenario H — a second that already holds `-41` and `-42` (copies of a real archive, so they carry
+the marker) and no base name, `keep=2`, cap `1 TB`:
+
+```
+seeded second: SimpleBackupsSameSecond_2026-11-23_17-40-41 (attempts: 1)
+new archive: SimpleBackupsSameSecond_2026-11-23_17-40-41-43.zip
+status: … last=SimpleBackupsSameSecond_2026-11-23_17-40-41-43.zip …
+both archives of the same second survive, -42 then -43
+```
+
+Scenario H2 — the same seeding with `keep=3` and a `1 B` cap: the cap removes `-41` and `-42` and
+**keeps the archive it just wrote** (`last=…-43.zip`, `over=true`).
+
+**The two scenes are fail-capable against the previous package.** Both were run on the exported
+0.2.3 game before rebuilding (`ADOPT_NEGATIVE=1`, `SAME_SECOND_NEGATIVE=1`; that game's record is
+`../_shared/evidence/simplebackups-e2e/build-record-0.2.3.txt`):
+
+```
+FAIL: ADOPT_NEGATIVE: the package deleted a manual export without an operator adoption — the scene fails on it, so it is alive
+EXIT:1
+```
+
+```
+FAIL: SAME_SECOND_NEGATIVE: the publish wrote SimpleBackupsSameSecondNeg_2026-11-23_17-33-21.zip and deleted it in the same pass (the reused base suffix) — the scene fails on it, so it is alive
+EXIT:1
+```
+
+The second line is the data-loss race itself: the archive that publish wrote was allocated the free
+base name, sorted behind `-41`/`-42`, and was one of the two the prune removed.
+
+Every earlier leg stays green: `PASS` + `EXIT:0` (`e2e-launcher.log`, scenarios A/B/C×2/D×2/E/F/G/H/H2),
+control `EXIT:1`, `SELFTEST=1` `EXIT:1`, `STALE_SELFTEST=1` `EXIT:1`; `check-e2e-logs.py
+simplebackups-e2e --strict` → `logs=6 ok=6`.
+
+### Package 0.2.4
+
+| | |
+|---|---|
+| version | **0.2.4** (`horizon-mod.toml` + `Cargo.toml`) |
+| bytes | **50,023 B** |
+| sha256 | `f7a25eaef989cda98400e5f9eb7a44cacfe58c2f0b40cb8c27c30b2b824733c5` |
+| entries | **10** — `horizon-mod.toml`, `Cargo.toml`, `LICENSE`, `LICENSE-NOTICE.md`, `README.md`, `src/{lib,runtime,support,zip}.rs`, `uses.json`; **no `Cargo.lock`** |
+| reproducible | second build after `rm -f Cargo.lock`: `cmp` identical, same sha |
+| `check` | `simplebackups 0.2.4 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, 50,023 bytes, exit 0 |
+| `fits --build 0a875da…` | `0a875da  made for` (the pin tautology, kept as the pin line) |
+| `fits --build 0b14f8a…` | `0b14f8a  fits` — the real gate, exit 0 |
+| tests | **53 passed, 0 failed** — 32 `runtime`, 10 `support`, 11 `zip` |
+| `verify-sdk-package.py` | `1/1`, `package matches the tree` |
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review
+
+### Changelog (0.2.4)
+
+> **0.2.4 — a legacy archive needs an operator, a same-second backup gets the next suffix, and a
+> malformed name can no longer panic.** `/simplebackups adopt <file>` (level 2) is now the only way
+> a marker-less archive becomes deletable: the world-zip shape alone is what a hand-made export
+> reproduces, so retention ignores such a file until an operator adopts that exact name and size
+> (`simplebackups-adopted.txt` in the backup folder; `status` reports `adopted=<n>`). A new backup
+> of a second that already holds `-N` is allocated `max+1` instead of the lowest free suffix, and
+> the archive a publish just wrote is never removed by `keep` or by the disk cap — reusing a pruned
+> suffix used to make the new backup sort behind an older one and be deleted in the same pass.
+> `parse_archive` takes the timestamp with a char-boundary-checked slice, so a ZIP name with a
+> multibyte character at byte 19 is refused instead of panicking the server tick. 53 tests;
+> scenarios G, H and H2 are green, and the 0.2.3 package fails both (the `negative` legs).
+> Package 50,023 B, sha256 `f7a25eae…`.
+
 ## Verification (re-pin `83ad384f`, 2026-11-06/07)
+
+
 
 Staged at Horizon `83ad384f48d0742746d518737511882680aab5b7` / horizon-mixins
 `e8cd0aa38cffef49cb2e088ef716baa107148c02` with `CARGO_INCREMENTAL=0`.
@@ -393,8 +565,9 @@ works while disabled`.
   incremental/chains/merge, Cherished Worlds/mc2discord and regex ignores are
   deferred.
 - Retention prunes after success (upstream deletes before creating), only archives the port can
-  identify as its own (a manifest since 0.2.3; the world-zip shape for 0.2.0–0.2.2), and after a
-  stale copy it prunes nothing at all; all three are deliberate safety changes.
+  identify as its own (a manifest since 0.2.3; a marker-less 0.2.0–0.2.2 archive only after an
+  operator's `/simplebackups adopt <file>`), and after a stale copy it prunes nothing at all; all
+  are deliberate safety changes.
 - Naming is UTC; upstream uses local time. Backup location is
   `<world>/backups` (upstream `<cwd>/simplebackups/<world>`).
 - `native_world_dir` is a pin gap: it is not cleared after a close, so the port

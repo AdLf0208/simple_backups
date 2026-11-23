@@ -18,23 +18,29 @@ the game glue and `src/zip.rs` the archive writer. The launcher compiles it agai
   publishes it by renaming, and skips `session.lock`, `.part`/`.tmp`, symlinks and the backups
   folder. Entries are `<world>/<relative path>`.
 - **Retention:** after a successful publish, the oldest archives this port wrote are pruned until
-  `keep` remain (`keep` is at least 1). An archive counts as this port's only when its own
-  `simplebackups.json` entry names this port and this world (archives from 0.2.0–0.2.2 are
-  recognised by their `<world>/…` + `<world>/level.dat` shape); a hand-made ZIP that merely
-  matches the `<world>_*.zip` name prefix is never deleted. Foreign files and `.part` files are
-  untouched.
+  `keep` remain (`keep` is at least 1). An archive counts as this port's when its own
+  `simplebackups.json` entry names this port and this world. An archive written before that marker
+  existed (0.2.0–0.2.2) has no identity until an operator runs `/simplebackups adopt <file>`: the
+  `<world>/…` + `<world>/level.dat` shape is exactly what a hand-made export looks like, so the
+  shape alone is never enough. A ZIP that merely matches the `<world>_*.zip` name prefix is never
+  deleted. Foreign files and `.part` files are untouched.
 - **Disk cap:** after the same publish, the backup folder is measured and this world's oldest
   **identified** archives are deleted until it is at most `max_disk_size` (default `"25 GB"`, binary
-  units, upstream's `maxDiskSize`), always keeping the newest archive. `/simplebackups status`
-  reports `disk=<size> cap=<size> over=<bool>`; foreign files count toward the folder size but are
-  never deleted. Same-second backups (`-1`, `-2`, … `-10`) are ordered by their numeric generation.
+  units, upstream's `maxDiskSize`). `/simplebackups status` reports
+  `disk=<size> cap=<size> over=<bool> adopted=<n>`; foreign files count toward the folder size but
+  are never deleted. Same-second backups (`-1`, `-2`, … `-10`) are ordered by their numeric
+  generation, and a new backup is always allocated **above the highest suffix present**, so a pruned
+  suffix is never reused. The archive a publish just wrote is never one of either pass's removal
+  candidates.
 - **A save that overlaps a copy:** the finished copy is thrown away and redone (`retry_on_save`,
   up to two retries) instead of publishing a possibly half-replaced region file. When retries are
   off, it is published and `/simplebackups status` reports `stale=true`; **both retention passes are
   then skipped**, so the previous confirmed restore point is never deleted in favour of a copy a
   save may have caught half-written (the folder may stay over the cap until the next good backup).
 - **Commands** (level 2): `/simplebackups backup [quiet]`, `/simplebackups status`,
-  `/simplebackups list`. A manual backup ignores `enabled`.
+  `/simplebackups list`, `/simplebackups adopt <file>`. A manual backup ignores `enabled`. `adopt`
+  records a marker-less archive (by name and size, in `simplebackups-adopted.txt` in the backup
+  folder) as this world's, which is the only way it becomes deletable.
 - **Config** `config/simplebackups.toml`: `enabled`, `interval_minutes`, `interval_ticks`, `keep`,
   `max_disk_size`, `compression_level`, `save_before_backup`, `retry_on_save`, `broadcast`,
   `backups_dir`, `ignored_paths`, `ignored_files`. A missing file is written with the defaults.

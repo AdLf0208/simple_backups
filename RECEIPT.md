@@ -1,11 +1,11 @@
-# Package receipt — simplebackups 0.2.6
+# Package receipt — simplebackups 0.2.7
 
 | field | value |
 |---|---|
-| version | `0.2.6` |
+| version | `0.2.7` |
 | file | `simplebackups.hmod` |
-| bytes | 53,344 |
-| sha256 | `a2261c76ce1f2e6df592262279df92573a9cecceb687f1624f1f44d260294c09` |
+| bytes | 60,637 |
+| sha256 | `f02f1aa1786e5b0d141ec4bed2e94535498a60c4bc600e4dc1a2a4af595f9656` |
 | source | this tag — the tree here is the source that produced the archive |
 | game | 26.3 |
 | horizon | `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` |

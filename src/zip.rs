@@ -483,12 +483,27 @@ fn records(file: &mut File) -> io::Result<Vec<Record>> {
 ///
 /// The file cannot be read, or is not a ZIP archive this reader understands.
 pub fn read_entry(path: &Path, wanted: &str) -> io::Result<Option<Vec<u8>>> {
+    read_entry_capped(path, wanted, MAX_ENTRY_READ)
+}
+
+/// Read any stored entry without the small `read_entry` cap, for a merge that must copy a whole
+/// world's files. The archive is one this port wrote, so its entries are all stored.
+///
+/// # Errors
+///
+/// The file cannot be read, or is not a ZIP archive this reader understands.
+pub fn read_entry_all(path: &Path, wanted: &str) -> io::Result<Option<Vec<u8>>> {
+    read_entry_capped(path, wanted, u64::MAX)
+}
+
+/// Read one stored entry, refusing one larger than `max`.
+fn read_entry_capped(path: &Path, wanted: &str, max: u64) -> io::Result<Option<Vec<u8>>> {
     let mut file = File::open(path)?;
     let index = records(&mut file)?;
     let Some(record) = index.iter().find(|record| record.name == wanted) else {
         return Ok(None);
     };
-    if record.method != METHOD_STORED || record.bytes > MAX_ENTRY_READ {
+    if record.method != METHOD_STORED || record.bytes > max {
         return Ok(None);
     }
     let mut header = [0u8; 30];

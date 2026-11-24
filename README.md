@@ -42,8 +42,19 @@ the game glue and `src/zip.rs` the archive writer. The launcher compiles it agai
   off, it is published and `/simplebackups status` reports `stale=true`; **both retention passes are
   then skipped**, so the previous confirmed restore point is never deleted in favour of a copy a
   save may have caught half-written (the folder may stay over the cap until the next good backup).
+- **Incremental chains** (opt-in): with `backup_type = "incremental"` the first backup is the
+  chain's full base and each later one is a child carrying **only the files modified since the
+  previous backup**; `"differential"` compares against the last full instead. This is upstream's
+  `BackupChain` / `BackupChainManager` / `ExperimentalConfig` model: a base, `child-0001.zip`…
+  children, and a compact metadata manifest naming the base, the kind, the changed entries and the
+  chain length. Here those facts travel in each archive's own `simplebackups.json`, so the flat
+  archives and their retention are unchanged. `/simplebackups status` reports `chain=<n>`. A
+  `full_backup_timer` (minutes, default 525960 ≈ 1 year, upstream's `fullBackupTimer`) forces a new
+  full base; `backup_type = "full"` (the default) never builds a chain.
+- **Merge** (level 2): `/simplebackups merge` folds the current chain into one standalone
+  `merged_backup-<UTC>.zip`, newest version of each entry wins — upstream's `mergeBackups`.
 - **Commands** (level 2): `/simplebackups backup [quiet]`, `/simplebackups status`,
-  `/simplebackups list`, `/simplebackups adopt <file>`, and the pause pair
+  `/simplebackups list`, `/simplebackups adopt <file>`, `/simplebackups merge`, and the pause pair
   `/simplebackups pause` / `/simplebackups unpause` (also accepted as
   `/simplebackups backup pause|unpause`, upstream's spelling). A manual backup ignores both
   `enabled` and `paused`. `adopt` records a marker-less archive (by name and size, in
@@ -57,7 +68,8 @@ the game glue and `src/zip.rs` the archive writer. The launcher compiles it agai
   ported (a `client`/UI half, outside this server-only logic port).
 - **Config** `config/simplebackups.toml`: `enabled`, `interval_minutes`, `interval_ticks`, `keep`,
   `max_disk_size`, `compression_level`, `save_before_backup`, `retry_on_save`, `broadcast`,
-  `backups_dir`, `ignored_paths`, `ignored_files`. A missing file is written with the defaults.
+  `backups_dir`, `ignored_paths`, `ignored_files`, `backup_type`, `full_backup_timer`. A missing
+  file is written with the defaults.
 
 ## Notes on this port
 

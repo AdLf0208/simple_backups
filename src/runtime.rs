@@ -25,6 +25,10 @@ pub struct Settings {
     pub max_disk_bytes: u64,
     pub ignored_paths: Vec<String>,
     pub ignored_files: Vec<String>,
+    /// Full backups, or an incremental chain (upstream's experimental backup type).
+    pub backup_type: BackupType,
+    /// How long an incremental chain runs before the next base is forced (minutes).
+    pub full_backup_timer_minutes: u64,
 }
 
 impl Default for Settings {
@@ -42,6 +46,9 @@ impl Default for Settings {
             max_disk_bytes: DEFAULT_MAX_DISK_BYTES,
             ignored_paths: Vec::new(),
             ignored_files: Vec::new(),
+            // Upstream ships full backups by default; chains are an experimental opt-in.
+            backup_type: BackupType::Full,
+            full_backup_timer_minutes: DEFAULT_FULL_BACKUP_TIMER_MINUTES,
         }
     }
 }
@@ -162,6 +169,16 @@ pub fn parse(input: &str) -> (Settings, Vec<String>) {
                 Some(parsed) => config.ignored_files = parsed,
                 None => warnings.push(format!("ignored_files: not an array: {value}")),
             },
+            "backup_type" => match parse_backup_type(value) {
+                Some(parsed) => config.backup_type = parsed,
+                None => warnings.push(format!(
+                    "backup_type: not full|incremental|differential: {value}"
+                )),
+            },
+            "full_backup_timer" => match value.parse::<u64>() {
+                Ok(parsed) => config.full_backup_timer_minutes = parsed,
+                Err(_) => warnings.push(format!("full_backup_timer: not a number: {value}")),
+            },
             other => warnings.push(format!("unknown key: {other}")),
         }
     }
@@ -220,6 +237,14 @@ pub fn to_toml(config: &Settings) -> String {
     out.push_str(&format!(
         "max_disk_size = \"{}\"\n",
         format_size_setting(config.max_disk_bytes)
+    ));
+    out.push_str(&format!(
+        "backup_type = \"{}\"\n",
+        config.backup_type.as_str()
+    ));
+    out.push_str(&format!(
+        "full_backup_timer = {}\n",
+        config.full_backup_timer_minutes
     ));
     out
 }
@@ -598,6 +623,11 @@ pub fn should_skip(relative: &str, backups_prefix: Option<&str>, config: &Settin
     if name == "session.lock" || name.ends_with(".part") || name.ends_with(".tmp") {
         return true;
     }
+    // The port's own state files sit beside the world and are written between backups. They
+    // would otherwise show up as "changed" in the next child, which is about world files only.
+    if name.starts_with("simplebackups-") && name.ends_with(".txt") {
+        return true;
+    }
     if let Some(prefix) = backups_prefix.and_then(normalise) {
         // Normalise the configured prefix exactly as the visited path was
         // normalised: `./backups` names the same folder as `backups`, and comparing
@@ -636,6 +666,10 @@ pub fn format_size(bytes: u64) -> String {
 
 /// Upstream's `maxDiskSize` default: `"25 GB"`, binary units (`CommonConfig.java:80-83`).
 pub const DEFAULT_MAX_DISK_BYTES: u64 = 25 * 1024 * 1024 * 1024;
+
+/// Upstream's `fullBackupTimer` default: 525960 minutes (~1 year), so a chain is
+/// effectively permanent unless the operator lowers it (`CommonConfig.java:67-68`).
+pub const DEFAULT_FULL_BACKUP_TIMER_MINUTES: u64 = 525_960;
 
 /// The size units the config accepts, largest first, all binary (`StorageSize.java:32-37`).
 const SIZE_UNITS: [(&str, u64); 5] = [
@@ -727,6 +761,306 @@ pub fn cap_removals(
         remaining_bytes,
         over: remaining_bytes > cap,
     }
+}
+
+// --- Incremental chains (0.2.7) ------------------------------------------------
+//
+// Upstream's `BackupChain` / `BackupChainManager` / `ExperimentalConfig` (read at
+// `bf04de3e`, branch `1.21.1`): an incremental chain is a **base full backup**
+// plus zero or more **children** that carry only the files changed since the
+// previous backup (INCREMENTAL) or the last full (DIFFERENTIAL). A compact
+// `metadata.json` in the chain directory names `backupType`, `fullBackup`,
+// `children` and `lastUpdated`; a child is `child-%04d.zip` (`index + 1`). This
+// port keeps its flat `<world>_<UTC>.zip` archives and retention, so the same
+// facts travel in each archive's own `simplebackups.json` instead.
+
+/// Upstream's `ExperimentalConfig.ExperimentalBackupType`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackupType {
+    /// Every backup carries the whole world (`FULL_BACKUPS`).
+    Full,
+    /// Changed since the previous backup (`INCREMENTAL` / `MODIFIED_SINCE_LAST`).
+    Incremental,
+    /// Changed since the last full (`DIFFERENTIAL` / `MODIFIED_SINCE_FULL`).
+    Differential,
+}
+
+impl BackupType {
+    /// The config spelling, also the value upstream's metadata stores.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Incremental => "incremental",
+            Self::Differential => "differential",
+        }
+    }
+}
+
+/// Whether a backup is the chain's full base or a changed-only child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackupKind {
+    Full,
+    Child,
+}
+
+/// The chain facts the port persists beside the world, mirroring upstream's
+/// `BackupData.lastSaved` / `lastFullBackup` plus which archives form the chain.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChainState {
+    pub base: Option<String>,
+    pub children: Vec<String>,
+    pub len: usize,
+    /// When the most recent backup started: the threshold for the next child.
+    pub last_backup_ms: u64,
+    /// When the most recent full base started: the differential threshold.
+    pub last_full_ms: u64,
+}
+
+/// The chain state file, beside the world like the pause and schedule files.
+pub const CHAIN_FILE: &str = "simplebackups-chain.txt";
+
+/// The manifest each archive carries. It keeps the `simplebackups/1` identity so retention is
+/// untouched, and adds the chain facts upstream keeps in its per-chain `metadata.json`: the base
+/// full backup, whether this is the full base or a child, the entries this archive actually holds,
+/// and the chain's length so far. Children carry only the entries whose mtime passed the threshold.
+#[must_use]
+pub fn chain_manifest(
+    world: &str,
+    backup: &str,
+    base: &str,
+    kind: BackupKind,
+    changed: &[String],
+    len: usize,
+) -> String {
+    let entries: Vec<String> = changed.iter().map(|name| json_string(name)).collect();
+    let kind = match kind {
+        BackupKind::Full => "full",
+        BackupKind::Child => "child",
+    };
+    format!(
+        "{{\"format\":\"{MANIFEST_FORMAT}\",\"world\":{},\"backup\":{},\
+         \"chain\":{},\"kind\":\"{kind}\",\"changed\":[{}],\"len\":{len}}}",
+        json_string(world),
+        json_string(backup),
+        json_string(base),
+        entries.join(",")
+    )
+}
+
+/// Parse a backup type from the config or upstream's metadata. Upstream's enum names
+/// (`FULL_BACKUPS`, `INCREMENTAL`/`MODIFIED_SINCE_LAST`, `DIFFERENTIAL`/`MODIFIED_SINCE_FULL`)
+/// are accepted as well as the port's shorter spelling.
+#[must_use]
+pub fn parse_backup_type(value: &str) -> Option<BackupType> {
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(value);
+    match value.to_ascii_uppercase().as_str() {
+        "FULL" | "FULL_BACKUPS" => Some(BackupType::Full),
+        "INCREMENTAL" | "MODIFIED_SINCE_LAST" => Some(BackupType::Incremental),
+        "DIFFERENTIAL" | "MODIFIED_SINCE_FULL" => Some(BackupType::Differential),
+        _ => None,
+    }
+}
+
+/// Whether the periodic-full timer has elapsed (upstream `fullBackupTimer`, minutes).
+#[must_use]
+pub fn full_timer_due(now_ms: u64, last_full_ms: u64, timer_minutes: u64) -> bool {
+    timer_minutes > 0 && now_ms.saturating_sub(last_full_ms) >= timer_minutes.saturating_mul(60_000)
+}
+
+/// Which kind of backup starts next (upstream `getChainBackupFilePath`): a full backup when
+/// full-mode, when no chain exists yet, or when the periodic-full timer is due; otherwise a child.
+#[must_use]
+pub fn choose_kind(backup_type: BackupType, has_base: bool, timer_due: bool) -> BackupKind {
+    if backup_type == BackupType::Full || !has_base || timer_due {
+        BackupKind::Full
+    } else {
+        BackupKind::Child
+    }
+}
+
+/// The mtime threshold a child filters by: `lastSaved` for incremental, `lastFullBackup` for
+/// differential (upstream `BackupThread.java:76`).
+#[must_use]
+pub fn changed_threshold(backup_type: BackupType, state: &ChainState) -> u64 {
+    match backup_type {
+        BackupType::Differential => state.last_full_ms,
+        BackupType::Full | BackupType::Incremental => state.last_backup_ms,
+    }
+}
+
+/// Whether one file belongs in this archive. Upstream's `BackupThread.java:395` tests
+/// `lastModified - lastSaved > 0` (strictly newer), and a full base includes every file.
+#[must_use]
+pub fn entry_changed(modified_ms: u64, threshold_ms: u64, full: bool) -> bool {
+    full || modified_ms > threshold_ms
+}
+
+/// The zips a merge reads, base first (upstream `MergeCommand.java:70-81`): a full chain merges
+/// just its base, an incremental chain the base and every child, a differential chain the base
+/// and only its newest child.
+#[must_use]
+pub fn merge_order(backup_type: BackupType, base: &str, children: &[String]) -> Vec<String> {
+    match backup_type {
+        BackupType::Full => vec![base.to_owned()],
+        BackupType::Incremental => {
+            let mut order = vec![base.to_owned()];
+            order.extend(children.iter().cloned());
+            order
+        }
+        BackupType::Differential => {
+            let mut order = vec![base.to_owned()];
+            if let Some(last) = children.last() {
+                order.push(last.clone());
+            }
+            order
+        }
+    }
+}
+
+/// The chain state as exact one-line keys. `-` is "no base yet" (the world has never been backed
+/// up), so an absent base does not have to be special-cased in the file's shape.
+#[must_use]
+pub fn format_chain(state: &ChainState) -> String {
+    let mut out = format!(
+        "base = {}\nlen = {}\nlast = {}\nfull = {}\n",
+        state.base.as_deref().unwrap_or("-"),
+        state.len,
+        state.last_backup_ms,
+        state.last_full_ms
+    );
+    for child in &state.children {
+        out.push_str("child = ");
+        out.push_str(child);
+        out.push('\n');
+    }
+    out
+}
+
+/// Read the chain state. Only a file this port wrote parses: all four keys must be present and
+/// well-formed; anything else leaves the chain fresh, exactly like a missing file.
+#[must_use]
+pub fn parse_chain(text: &str) -> Option<ChainState> {
+    let mut base = None;
+    let mut children = Vec::new();
+    let mut len = None;
+    let mut last = None;
+    let mut full = None;
+    for line in text.lines() {
+        let (key, value) = line.split_once(" = ")?;
+        match key {
+            "base" => {
+                base = if value == "-" {
+                    None
+                } else if value.is_empty() || value.contains('\t') {
+                    return None;
+                } else {
+                    Some(value.to_owned())
+                }
+            }
+            "child" => {
+                if value.is_empty() || value.contains('\t') {
+                    return None;
+                }
+                children.push(value.to_owned());
+            }
+            "len" => len = Some(value.parse().ok()?),
+            "last" => last = Some(value.parse().ok()?),
+            "full" => full = Some(value.parse().ok()?),
+            _ => return None,
+        }
+    }
+    Some(ChainState {
+        base,
+        children,
+        len: len?,
+        last_backup_ms: last?,
+        last_full_ms: full?,
+    })
+}
+
+/// The base named by a chain manifest.
+#[must_use]
+pub fn manifest_chain(text: &str) -> Option<String> {
+    json_field(text, "chain")
+}
+
+/// The kind named by a chain manifest.
+#[must_use]
+pub fn manifest_kind(text: &str) -> Option<BackupKind> {
+    match json_field(text, "kind").as_deref() {
+        Some("full") => Some(BackupKind::Full),
+        Some("child") => Some(BackupKind::Child),
+        _ => None,
+    }
+}
+
+/// The changed entries named by a chain manifest (a flat array of JSON strings).
+#[must_use]
+pub fn manifest_changed(text: &str) -> Vec<String> {
+    let needle = "\"changed\"";
+    let Some(at) = text.find(needle).map(|at| at + needle.len()) else {
+        return Vec::new();
+    };
+    let Some(rest) = text[at..]
+        .trim_start()
+        .strip_prefix(':')
+        .map(str::trim_start)
+    else {
+        return Vec::new();
+    };
+    let Some(inner) = rest
+        .strip_prefix('[')
+        .and_then(|r| r.split_once(']').map(|(v, _)| v))
+    else {
+        return Vec::new();
+    };
+    inner
+        .split(',')
+        .filter_map(|item| unquote_json(item.trim()))
+        .collect()
+}
+
+/// The chain length named by a chain manifest.
+#[must_use]
+pub fn manifest_len(text: &str) -> Option<usize> {
+    let needle = "\"len\"";
+    let at = text.find(needle)? + needle.len();
+    let rest = text[at..].trim_start().strip_prefix(':')?.trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// Unescape one JSON string literal (`json_string`'s inverse).
+fn unquote_json(value: &str) -> Option<String> {
+    let mut chars = value.strip_prefix('"')?.chars();
+    let mut out = String::new();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    let digits: String = chars.by_ref().take(4).collect();
+                    out.push(char::from_u32(u32::from_str_radix(&digits, 16).ok()?)?);
+                }
+                _ => return None,
+            },
+            ch => out.push(ch),
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1319,6 +1653,182 @@ mod tests {
         assert!(
             manifest_identifies(&quoted, "World \"quoted\""),
             "the writer escapes what the reader unescapes: {quoted}"
+        );
+    }
+
+    // --- Incremental chains (0.2.7) -------------------------------------------
+
+    #[test]
+    fn a_changed_entry_is_one_modified_after_the_threshold() {
+        assert!(
+            entry_changed(2_000, 1_000, false),
+            "a file written after the previous backup is changed"
+        );
+        assert!(
+            !entry_changed(1_000, 1_000, false),
+            "the boundary is strict: upstream tests lastModified - lastSaved > 0"
+        );
+        assert!(
+            !entry_changed(500, 1_000, false),
+            "an older file is not changed"
+        );
+        assert!(
+            entry_changed(1, u64::MAX, true),
+            "a full base carries every file, whatever its mtime"
+        );
+    }
+
+    #[test]
+    fn the_first_backup_of_a_chain_is_full_and_later_ones_are_children() {
+        assert_eq!(
+            choose_kind(BackupType::Incremental, false, false),
+            BackupKind::Full,
+            "no base yet: the first backup is the full base"
+        );
+        assert_eq!(
+            choose_kind(BackupType::Incremental, true, false),
+            BackupKind::Child
+        );
+        assert_eq!(
+            choose_kind(BackupType::Incremental, true, true),
+            BackupKind::Full,
+            "the periodic full timer forces a new base"
+        );
+        assert_eq!(
+            choose_kind(BackupType::Full, true, false),
+            BackupKind::Full,
+            "FULL_BACKUPS never builds a chain"
+        );
+    }
+
+    #[test]
+    fn differential_changes_since_the_full_but_incremental_since_the_last() {
+        let state = ChainState {
+            last_backup_ms: 5_000,
+            last_full_ms: 1_000,
+            ..ChainState::default()
+        };
+        assert_eq!(changed_threshold(BackupType::Incremental, &state), 5_000);
+        assert_eq!(changed_threshold(BackupType::Differential, &state), 1_000);
+        // A file written after the full but before the last backup: incremental (threshold
+        // 5_000) already carried it, so the child skips it; differential (threshold 1_000)
+        // must carry it again because the last full did not see it.
+        assert!(!entry_changed(
+            3_000,
+            changed_threshold(BackupType::Incremental, &state),
+            false
+        ));
+        assert!(entry_changed(
+            3_000,
+            changed_threshold(BackupType::Differential, &state),
+            false
+        ));
+    }
+
+    #[test]
+    fn the_full_timer_is_upstreams_minutes_to_milliseconds() {
+        assert!(!full_timer_due(1_000, 0, 10));
+        assert!(!full_timer_due(599_999, 0, 10));
+        assert!(full_timer_due(600_000, 0, 10));
+        assert!(
+            !full_timer_due(u64::MAX, u64::MAX, 10),
+            "no overflow into due"
+        );
+    }
+
+    #[test]
+    fn backup_types_parse_from_both_the_config_and_upstream_metadata() {
+        assert_eq!(parse_backup_type("full"), Some(BackupType::Full));
+        assert_eq!(
+            parse_backup_type("incremental"),
+            Some(BackupType::Incremental)
+        );
+        assert_eq!(
+            parse_backup_type("differential"),
+            Some(BackupType::Differential)
+        );
+        assert_eq!(parse_backup_type("FULL_BACKUPS"), Some(BackupType::Full));
+        assert_eq!(
+            parse_backup_type("INCREMENTAL"),
+            Some(BackupType::Incremental)
+        );
+        assert_eq!(
+            parse_backup_type("MODIFIED_SINCE_FULL"),
+            Some(BackupType::Differential)
+        );
+        assert_eq!(parse_backup_type("nonsense"), None);
+    }
+
+    #[test]
+    fn the_chain_manifest_names_the_base_kind_changed_entries_and_length() {
+        let changed = vec!["World/changed.txt".to_owned(), "World/level.dat".to_owned()];
+        let text = chain_manifest(
+            "World",
+            "World_2026-01-01_00-00-01.zip",
+            "World_2026-01-01_00-00-00.zip",
+            BackupKind::Child,
+            &changed,
+            2,
+        );
+        assert_eq!(
+            manifest_chain(&text).as_deref(),
+            Some("World_2026-01-01_00-00-00.zip")
+        );
+        assert_eq!(manifest_kind(&text), Some(BackupKind::Child));
+        assert_eq!(manifest_changed(&text), changed);
+        assert_eq!(manifest_len(&text), Some(2));
+        assert!(
+            manifest_identifies(&text, "World"),
+            "the chain manifest still identifies this port and world for retention"
+        );
+        let full = chain_manifest(
+            "World",
+            "World_2026-01-01_00-00-00.zip",
+            "World_2026-01-01_00-00-00.zip",
+            BackupKind::Full,
+            &[],
+            1,
+        );
+        assert_eq!(manifest_kind(&full), Some(BackupKind::Full));
+        assert_eq!(manifest_len(&full), Some(1));
+        assert!(manifest_changed(&full).is_empty());
+    }
+
+    #[test]
+    fn the_chain_state_round_trips_through_its_file() {
+        let state = ChainState {
+            base: Some("World_2026-01-01_00-00-00.zip".to_owned()),
+            children: vec!["World_2026-01-01_00-00-01.zip".to_owned()],
+            len: 2,
+            last_backup_ms: 12_345,
+            last_full_ms: 1_000,
+        };
+        let text = format_chain(&state);
+        assert_eq!(parse_chain(&text), Some(state));
+        assert_eq!(parse_chain(""), None, "a world with no chain starts fresh");
+        assert_eq!(
+            parse_chain("garbage\n"),
+            None,
+            "a hand-edited file is refused"
+        );
+    }
+
+    #[test]
+    fn merge_reads_the_full_and_the_right_children() {
+        let base = "full.zip".to_owned();
+        let children = vec!["child-0001.zip".to_owned(), "child-0002.zip".to_owned()];
+        assert_eq!(
+            merge_order(BackupType::Full, &base, &children),
+            std::slice::from_ref(&base)
+        );
+        assert_eq!(
+            merge_order(BackupType::Incremental, &base, &children),
+            [base.clone(), children[0].clone(), children[1].clone()]
+        );
+        assert_eq!(
+            merge_order(BackupType::Differential, &base, &children),
+            [base, children[1].clone()],
+            "a differential merge needs only the full and the newest child"
         );
     }
 }

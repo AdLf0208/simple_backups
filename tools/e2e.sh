@@ -53,6 +53,14 @@
 #   ticks must make no zip and 40 more exactly one. Only the newest `status`/`list` reply is parsed
 #   (a stale line in the 20-message chat buffer made a false red in 0.2.5). SELFTEST=ticks inverts
 #   the restored-value assertion and exits non-zero.
+# Scenario K: incremental chains (upstream's BackupChain*). With `backup_type =
+# "incremental"`, a first full base and a second backup after one world file changed: the second
+# archive's `simplebackups.json` must name the base and carry ONLY the changed entry; `status`
+# must report `chain=2` and `list` must name both. A fresh world's first backup is full with
+# `chain=1` (the differential). `save_before_backup=false` keeps the game from rewriting other
+# world files between the two backups, so exactly one entry is changed. SELFTEST=chain inverts
+# the manifest/base assertion and exits non-zero.
+#
 # Scenario J2 (differential): a FRESH scratch world has no state file, so its interval starts at
 #   world open (scenario J's seeded counter makes one come 10 ticks sooner). It must wait a full
 #   interval from its own start; the empty window is sized from the ticks it actually reports,
@@ -216,6 +224,28 @@ retry_on_save = $retry
 broadcast = false
 backups_dir = "backups"
 max_disk_size = "$cap"
+EOF
+}
+
+# The chain scenario's config: the interval stays at 40 ticks, but the two backups are manual so
+# the single changed file is written between them with no schedule race.
+write_chain_config() { # config-dir backup-type
+    local dir=$1 type=$2
+    mkdir -p "$dir"
+    cat > "$dir/simplebackups.toml" <<EOF
+enabled = false
+interval_minutes = 0
+interval_ticks = 40
+keep = 3
+compression_level = 1
+save_before_backup = false
+retry_on_save = true
+broadcast = false
+backups_dir = "backups"
+max_disk_size = "25 GB"
+backup_type = "$type"
+full_backup_timer = 525960
+ignored_paths = ["dimensions", "region"]
 EOF
 }
 
@@ -701,7 +731,7 @@ run_pause_scenario() {
     ctl wait 5
     local status status_line
     status=$(status_text)
-    status_line=$(ctl messages 20 | jq -r '.chat[]' | grep -m1 'saves=')
+    status_line=$(newest_status_line) || fail "no status reply after pause"
     echo "status after pause: $status"
     echo "paused line: $status_line"
     grep -q 'paused=true' <<<"$status_line" || fail "pause did not report paused=true: $status_line"
@@ -734,7 +764,7 @@ run_pause_scenario() {
     ctl chat "/simplebackups backup unpause"
     ctl wait 5
     status=$(status_text)
-    status_line=$(ctl messages 20 | jq -r '.chat[]' | grep -m1 'saves=')
+    status_line=$(newest_status_line) || fail "no status reply after unpause"
     echo "status after unpause: $status"
     echo "paused line: $status_line"
     grep -q 'paused=false' <<<"$status_line" || fail "unpause did not report paused=false: $status_line"
@@ -751,7 +781,7 @@ run_pause_scenario() {
     # "name (size)"), never the older `last=<name>` fragments in the chat buffer.
     local listing
     listing=$(ctl chat "/simplebackups list" >/dev/null; ctl wait 5 >/dev/null; \
-        ctl messages 20 | jq -r '.chat[]' | grep -m1 '\.zip (')
+        ctl messages 20 | jq -r '.chat[]' | grep -m1 '\.zip (' || true)
     echo "list: $listing"
     grep -qF "$(basename "$resumed")" <<<"$listing" || fail "list does not name the resumed archive: $listing"
     if grep -qF "$(basename "$manual")" <<<"$listing"; then
@@ -786,13 +816,20 @@ run_schedule_scenario() {
     echo "fresh-world backup: $before"
     check_zip "$before" "$world"
 
-    # Let the counter advance past zero, then read the NEWEST status line only.
-    ctl wait 8
-    ctl chat "/simplebackups status" >/dev/null
-    ctl wait 3 >/dev/null
-    local status_line ticks_before
-    status_line=$(newest_status_line) || fail "no status reply before quitting"
-    ticks_before=$(sed -n 's/.*ticks=\([0-9]*\).*/\1/p' <<<"$status_line")
+    # Let the counter advance past zero, then read the NEWEST status line only. On a busy box a
+    # single ctl round-trip can advance the headless counter by a whole interval, so a sample can
+    # land back on 0; retry until it is mid-interval instead of false-redding on the drift.
+    local status_line ticks_before attempt
+    for attempt in $(seq 1 20); do
+        ctl wait 2 >/dev/null
+        ctl chat "/simplebackups status" >/dev/null
+        ctl wait 3 >/dev/null
+        status_line=$(newest_status_line) || continue
+        ticks_before=$(sed -n 's/.*ticks=\([0-9]*\).*/\1/p' <<<"$status_line")
+        if [ -n "$ticks_before" ] && [ "$ticks_before" -gt 0 ] && [ "$ticks_before" -lt 20 ]; then
+            break
+        fi
+    done
     echo "counter before quit: $ticks_before ($status_line)"
     [ -n "$ticks_before" ] || fail "status did not report ticks=: $status_line"
     [ "$ticks_before" -gt 0 ] && [ "$ticks_before" -lt 20 ] \
@@ -914,6 +951,169 @@ run_fresh_schedule_scenario() {
     rm -rf "$scratch"
 }
 
+# Scenario K: incremental chains. The base is a full backup; the child, taken after one world
+# file changed, must name the base and carry only that entry. `status` reports chain=2, `list`
+# names both, and `merge` folds the chain into one standalone archive. A fresh world's first
+# backup is full with chain=1 (the differential). SELFTEST=chain inverts the base assertion.
+run_chain_scenario() { # world sock [selftest]
+    local world=$1 sock=$2 mode=${3:-0}
+    local scratch
+    scratch=$(mktemp -d "${E2E_TMP:-/tmp/opencode}/simplebackups-chain.XXXXXX")
+    write_chain_config "${CONFIG_DIR:-$scratch/config}" incremental
+    launch "$sock" "$scratch" "$GAME" "$world"
+    local ctl
+    ctl() { "$CTL" --socket "$sock" "$@"; }
+    ctl wait-ready 120
+    ctl wait 10
+    local world_dir="$scratch/saves/$world"
+    local backups="$world_dir/backups"
+
+    # The first backup is the full base of the chain.
+    ctl chat "/simplebackups backup"
+    wait_for_zip "$backups" 1 || fail "the base backup did not appear"
+    local base base_name
+    base=$(first_zip "$backups")
+    base_name=$(basename "$base")
+    echo "full base: $base"
+    python3 - "$base" "$world" "$base_name" <<'PY'
+import json, sys, zipfile
+path, world, name = sys.argv[1:]
+with zipfile.ZipFile(path) as z:
+    assert z.testzip() is None
+    m = json.load(z.open("simplebackups.json"))
+    assert m["format"] == "simplebackups/1", m
+    assert m["world"] == world, m
+    assert m["kind"] == "full", m
+    assert m["len"] == 1, m
+    assert m["chain"] == name, m
+    print(f"base manifest: kind={m['kind']} chain={m['chain']} len={m['len']}")
+PY
+
+    # Change exactly one world file, then take the second (child) backup.
+    printf 'changed by scenario K\n' > "$world_dir/changed-marker.txt"
+    ctl chat "/simplebackups backup"
+    wait_for_other_zip "$backups" "$base_name" || fail "the child backup did not appear"
+    local child child_name
+    child=$(find "$backups" -maxdepth 1 -name '*.zip' ! -name "$base_name" | head -1)
+    child_name=$(basename "$child")
+    echo "child backup: $child"
+
+    local manifest_base manifest_kind manifest_changed manifest_len
+    manifest_base=$(python3 - "$child" <<'PY'
+import json, sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    m = json.load(z.open("simplebackups.json"))
+    print(m.get("chain", ""), m.get("kind", ""), m.get("len", ""), ",".join(m.get("changed", [])))
+PY
+)
+    manifest_kind=$(awk '{print $2}' <<<"$manifest_base")
+    manifest_len=$(awk '{print $3}' <<<"$manifest_base")
+    manifest_changed=$(awk '{print $4}' <<<"$manifest_base")
+    local named_base
+    named_base=$(awk '{print $1}' <<<"$manifest_base")
+    echo "child manifest: chain=$named_base kind=$manifest_kind len=$manifest_len changed=$manifest_changed"
+
+    if [ "${mode:-0}" = "chain" ]; then
+        fail "CHAIN SELFTEST: the child manifest named the base ($named_base) — the assertion is alive"
+    fi
+    [ "$named_base" = "$base_name" ] \
+        || fail "the child manifest does not name the base: $named_base (wanted $base_name)"
+    [ "$manifest_kind" = "child" ] || fail "the child is not marked as a child: $manifest_kind"
+    [ "$manifest_len" = "2" ] || fail "the chain length is not 2: $manifest_len"
+    [ "$manifest_changed" = "$world/changed-marker.txt" ] \
+        || fail "the child did not carry only the changed entry: $manifest_changed"
+    # A child must not re-carry unchanged world files: its only entries are the manifest and
+    # the one changed file (upstream's changed-only partial backup).
+    python3 - "$child" "$world" <<'PY'
+import sys, zipfile
+path, world = sys.argv[1:]
+with zipfile.ZipFile(path) as z:
+    names = sorted(z.namelist())
+    assert set(names) == {
+        "simplebackups.json",
+        f"{world}/changed-marker.txt",
+    }, f"a child carried more than the changed entry: {names}"
+PY
+    echo "the child carries only the changed entry; the base and the change are in the manifest"
+
+    # The parsed newest status line reports chain=2; list names both archives.
+    local status_line listing
+    ctl chat "/simplebackups status" >/dev/null
+    ctl wait 3 >/dev/null
+    status_line=$(newest_status_line) || fail "no status reply after the child"
+    echo "status: $status_line"
+    grep -q 'chain=2' <<<"$status_line" || fail "status did not report chain=2: $status_line"
+    listing=$(ctl chat "/simplebackups list" >/dev/null; ctl wait 5 >/dev/null; \
+        ctl messages 20 | jq -r '.chat[]' | grep '\.zip (' || true)
+    echo "list: $listing"
+    grep -qF "$base_name" <<<"$listing" || fail "list does not name the base: $listing"
+    grep -qF "$child_name" <<<"$listing" || fail "list does not name the child: $listing"
+
+    # Merge folds the chain into one full, standalone archive (newest entry wins).
+    ctl chat "/simplebackups merge" >/dev/null
+    local merged="" i
+    for i in $(seq 1 60); do
+        merged=$(find "$backups" -maxdepth 1 -name 'merged_backup-*.zip' 2>/dev/null | head -1)
+        [ -n "$merged" ] && break
+        sleep 0.25
+    done
+    [ -n "$merged" ] || fail "merge did not produce a standalone archive"
+    python3 - "$merged" "$world" <<'PY'
+import json, sys, zipfile
+path, world = sys.argv[1:]
+with zipfile.ZipFile(path) as z:
+    assert z.testzip() is None
+    names = z.namelist()
+    m = json.load(z.open("simplebackups.json"))
+    assert m["kind"] == "full", m
+    assert f"{world}/changed-marker.txt" in names, names
+    print(f"merged archive: {len(names)} entries, kind={m['kind']}")
+PY
+    echo "merge folded the chain into one standalone archive"
+
+    ctl quit >/dev/null 2>&1 || true
+    sleep 1
+    rm -rf "$scratch"
+
+    # Differential: a FRESH world with no chain state makes a full first backup, chain=1.
+    local fresh_world="${world}Fresh"
+    scratch=$(mktemp -d "${E2E_TMP:-/tmp/opencode}/simplebackups-chain-fresh.XXXXXX")
+    write_chain_config "${CONFIG_DIR:-$scratch/config}" incremental
+    launch "$sock" "$scratch" "$GAME" "$fresh_world"
+    ctl() { "$CTL" --socket "$sock" "$@"; }
+    ctl wait-ready 120
+    ctl wait 10
+    local fresh_backups="$scratch/saves/$fresh_world/backups"
+    ctl chat "/simplebackups backup"
+    wait_for_zip "$fresh_backups" 1 || fail "the fresh world's first backup did not appear"
+    local fresh fresh_name
+    fresh=$(first_zip "$fresh_backups")
+    fresh_name=$(basename "$fresh")
+    echo "fresh-world first backup: $fresh"
+    # Ask for status explicitly: the 20-message buffer still holds the *previous* world's
+    # `saves=… chain=2` line, and only the newest reply may be parsed (the 0.2.5 trap).
+    ctl chat "/simplebackups status" >/dev/null
+    ctl wait 3 >/dev/null
+    python3 - "$fresh" "$fresh_name" <<'PY'
+import json, sys, zipfile
+path, name = sys.argv[1:]
+with zipfile.ZipFile(path) as z:
+    m = json.load(z.open("simplebackups.json"))
+    assert m["kind"] == "full", m
+    assert m["len"] == 1, m
+    assert m["chain"] == name, m
+    print(f"fresh-world manifest: kind={m['kind']} chain={m['chain']} len={m['len']}")
+PY
+    local fresh_status
+    fresh_status=$(newest_status_line) || fail "no status reply on the fresh world"
+    echo "fresh-world status: $fresh_status"
+    grep -q 'chain=1' <<<"$fresh_status" || fail "the fresh world did not report chain=1: $fresh_status"
+    echo "fresh-world differential: the first backup is full with chain=1"
+    ctl quit >/dev/null 2>&1 || true
+    sleep 1
+    rm -rf "$scratch"
+}
+
 # The control leg: the same scene on a game without the mod creates no backup at
 # all, so "a zip appeared" is the mod's doing and not the engine's.
 run_control_scenario() {
@@ -945,10 +1145,21 @@ if [ "${SELFTEST:-0}" = "ticks" ]; then
     run_schedule_scenario SimpleBackupsTicksSelf "${E2E_TMP:-/tmp/opencode}/simplebackups-ticks-self.sock"
     fail "TICKS SELFTEST inconclusive: the schedule scene returned without its assertion"
 fi
+if [ "${SELFTEST:-0}" = "chain" ]; then
+    echo "== scenario K selftest: invert the chain manifest/base assertion =="
+    run_chain_scenario SimpleBackupsChainSelf "${E2E_TMP:-/tmp/opencode}/simplebackups-chain-self.sock" chain
+    fail "CHAIN SELFTEST inconclusive: the chain scene returned without its assertion"
+fi
 if [ "${ONLY:-}" = "J" ]; then
     echo "== scenario J alone (diagnostic) =="
     run_schedule_scenario SimpleBackupsScheduleDiag "${E2E_TMP:-/tmp/opencode}/simplebackups-j-diag.sock"
     echo "PASS: scenario J alone"
+    exit 0
+fi
+if [ "${ONLY:-}" = "K" ]; then
+    echo "== scenario K alone (diagnostic) =="
+    run_chain_scenario SimpleBackupsChainDiag "${E2E_TMP:-/tmp/opencode}/simplebackups-k-diag.sock"
+    echo "PASS: scenario K alone"
     exit 0
 fi
 if [ "${STALE_SELFTEST:-0}" = 1 ]; then
@@ -994,6 +1205,8 @@ echo "== scenario J: the persisted schedule counter survives quit and relaunch =
 run_schedule_scenario SimpleBackupsSchedule "${E2E_TMP:-/tmp/opencode}/simplebackups-schedule.sock"
 echo "== scenario J2: a fresh world waits the full interval =="
 run_fresh_schedule_scenario SimpleBackupsFresh "${E2E_TMP:-/tmp/opencode}/simplebackups-fresh.sock"
+echo "== scenario K: incremental chains (base + changed-only child, merge, fresh-world differential) =="
+run_chain_scenario SimpleBackupsChain "${E2E_TMP:-/tmp/opencode}/simplebackups-chain.sock"
 # The control is opt-in (CONTROL=1 with CONTROL_GAME): the campaign's control leg is the same
 # e2e run with `GAME=$CONTROL_GAME`, and launching a second game here raced the first one's
 # socket and scratch.
@@ -1001,4 +1214,4 @@ if [ "${CONTROL:-0}" = 1 ]; then
     echo "== control: the unmodded game creates no backup =="
     run_control_scenario SimpleBackupsControl /tmp/opencode/simplebackups-e.sock
 fi
-echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); a manual export with the world's own shape survives until an operator adopts it and is pruned after (scenario G); a backup allocated in a second that already has generations becomes the highest suffix and survives keep and the cap (scenario H, H2); pause suppresses only the schedule and persists beside the world, a manual backup still works while paused, and unpause resumes with exactly one new zip named by list (scenario I); the tick counter resumes from the persisted state beside the world across quit and relaunch, while a fresh world with no state file waits the full interval (scenarios J, J2)"
+echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); a manual export with the world's own shape survives until an operator adopts it and is pruned after (scenario G); a backup allocated in a second that already has generations becomes the highest suffix and survives keep and the cap (scenario H, H2); pause suppresses only the schedule and persists beside the world, a manual backup still works while paused, and unpause resumes with exactly one new zip named by list (scenario I); the tick counter resumes from the persisted state beside the world across quit and relaunch, while a fresh world with no state file waits the full interval (scenarios J, J2); an incremental chain's child names its full base and carries only the changed file, status reports chain=2 and list names both, merge folds the chain into one standalone archive, and a fresh world's first backup is full with chain=1 (scenario K)"

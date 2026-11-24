@@ -226,7 +226,8 @@ phase that asserts it.
 | `latest.log` → `backup.log` | not ported | gap (needs a path outside the world folder) |
 | disk reservation before a copy | not ported | gap (upstream's `NotEnoughDiskSpaceException`) |
 | persisted schedule counter (tick mode) | tested | scenario J: a zip before quit, the state file beside the world confirmed and seeded to `ticks = 10`, `ctl quit` + relaunch of the same world, `ticks=<restored ≥ 10>` parsed from the newest status line, an empty window sized from the restored value, then a fresh zip (`check_zip` CRC + manifest); `SELFTEST=ticks` (`EXIT:1`) inverts the restored value; pure rules `runtime::tests::{the_persisted_tick_counter_round_trips_through_its_file, a_restored_counter_resumes_the_interval}`, file round-trip `support::tests::the_schedule_counter_is_persisted_beside_the_world`; scenario J2 is the fresh-world differential (no state file, `ticks=0`, needs the full interval) |
-| partial / chains / merge, regex ignores | not ported | gaps: incremental/chains/merge is a larger design task; a regex needs a crate (R9 forbids a registry dependency) |
+| partial / chains / merge | tested | scenario K: an incremental child names its full base, carries only `World/changed-marker.txt`, `status` reports `chain=2`, `list` names both, `merge` writes a standalone archive; the fresh-world first backup is full with `chain=1`; `SELFTEST=chain` (`EXIT:1`) inverts the base assertion. Pure rules: `entry_changed`, `choose_kind`, `changed_threshold`, `full_timer_due`, `merge_order`, the chain-state and manifest round-trips. |
+| regex ignores | not ported | R9 forbids the `regex` crate a registry dependency would need; implemented without one would mean re-writing a matcher here, deferred |
 
 ## Slice 3 (0.2.3, 2026-11-23) — review fix: retention's identity, a stale copy, same-second order
 
@@ -770,6 +771,152 @@ dirs came from `E2E_TMP` under `~/.cache/horizon-e2e/scratch` — never `/tmp`.
 > remain out of scope (R9). 59 tests; scenario J (quit and relaunch the same world) and scenario J2
 > (a fresh world's full interval) prove it in game.
 
+## Slice 7 (0.2.7, 2026-11-24) — incremental chains (base + changed-only children, merge)
+
+**Gap line.** The coverage table above: *"partial / chains / merge, regex ignores | not ported |
+gaps: incremental/chains/merge is a larger design task; a regex needs a crate (R9 forbids a
+registry dependency)"*, and *Gaps after the migration* item 4. We close the **partial / chains /
+merge** half; regex ignores stay `not ported` (R9 forbids the crate). It fits **server-only /
+logic**: pure rules in `runtime.rs`, the existing worker/publish path, one persisted state file and
+one extra command — no new hook, block entity, menu, renderer or dependency. `horizon/docs/modpacks.md`
+puts "backups" in the server-only class and "server events, typed commands" in the logic tier.
+
+**Upstream format (read from the re-cloned `1.21.1` head `bf04de3e7b3e05504ee5cc974cf45833b0d4b9a4`,
+`ports/_shared/upstream/simplebackups-src/`).** `BackupChain.java`, `BackupChainManager.java`,
+`ExperimentalConfig.java`, `BackupThread.java`, `commands/MergeCommand.java`, `BackupData.java`:
+
+- `metadata.json` (compact Gson, keys in this order) holds `backupType` (`FULL_BACKUPS` /
+  `INCREMENTAL` / `DIFFERENTIAL`), `fullBackup` (`"full.zip"`), `children`
+  (`"child-0001.zip"`, `child-%04d` with index = children.size()+1) and `lastUpdated` (millis).
+- **Base choice** (`BackupThread.java:288-301`): a new full chain (`createChain`, dir named for the
+  UTC stamp) when `fullBackup` — no data, FULL_BACKUPS, or `now - fullBackupTimer > lastFullBackup`
+  (default `525960` min) — or when no chain exists; otherwise `latestChain.createChild()`.
+- **Changed entries** (`:394-395`): `lastModified - lastSaved > 0` (strict); `lastSaved` is
+  `BackupData.lastSaved` for `MODIFIED_SINCE_LAST` (incremental) and `lastFullBackup` for
+  `MODIFIED_SINCE_FULL` (differential). A full base carries every file. `lastSaved` is updated when
+  the worker *starts*, not when it succeeds (`:91-95`).
+- **Retention** in experimental mode deletes whole chain dirs, oldest by `lastUpdated`, down to
+  `backupsToKeep`, never the last; the cap deletes oldest chains but keeps one.
+- **Merge** (`MergeCommand.java:70-81`): INCREMENTAL = full + all children, DIFFERENTIAL = full +
+  last child; per entry name the newest archive wins; output `merged_backup-<UUID>.zip`.
+
+**Port decisions.** The port keeps its flat `<world>_<UTC>.zip` archives and the 0.2.3/0.2.4
+retention identity, so the chain facts travel in each archive's own `simplebackups.json` instead of
+a directory's `metadata.json`. The manifest **keeps `format = simplebackups/1`** (retention is
+untouched) and gains `chain` (base name), `kind` (`full`/`child`), `changed` (the entries this
+archive holds) and `len` (chain length). `ChainState` (`base`, `children`, `len`, `last_backup_ms`,
+`last_full_ms`) is persisted in `simplebackups-chain.txt` beside the world with a staged rename and
+restored when the world opens — upstream's `BackupData` SavedData, which a native mod lacks. Pure
+rules: `parse_backup_type`, `full_timer_due`, `choose_kind`, `changed_threshold`, `entry_changed`,
+`merge_order`, the chain-state file round-trip and the manifest's parser/writer. Config gains
+`backup_type` (default `"full"`, so every earlier scenario and package behaviour is unchanged) and
+`full_backup_timer` (minutes, default 525960). `/simplebackups status` appends `chain=<n>` to the
+existing `saves=` line; `/simplebackups merge` folds the chain into `merged_backup-<UTC>.zip`.
+The port's own `simplebackups-*.txt` state files are skipped by the walk, so they cannot appear as
+"changed" entries. The 0.2.4 adoption/retention fixes, the 0.2.5 pause flag and the 0.2.6 schedule
+counter are byte-for-byte unchanged in behaviour.
+
+**Red → green.** Nine failing tests first, against stubs (`sdk-test-red-chain.log`):
+
+```
+---- runtime::tests::a_changed_entry_is_one_modified_after_the_threshold stdout ----
+thread 'runtime::tests::a_changed_entry_is_one_modified_after_the_threshold' (333845) panicked at src/runtime.rs:1487:9:
+a file written after the previous backup is changed
+
+---- runtime::tests::backup_types_parse_from_both_the_config_and_upstream_metadata stdout ----
+assertion `left == right` failed
+  left: None
+ right: Some(Full)
+
+---- runtime::tests::the_first_backup_of_a_chain_is_full_and_later_ones_are_children stdout ----
+assertion `left == right` failed
+  left: Full
+ right: Child
+
+---- runtime::tests::the_chain_manifest_names_the_base_kind_changed_entries_and_length stdout ----
+assertion `left == right` failed
+  left: None
+ right: Some("World_2026-01-01_00-00-00.zip")
+
+---- support::tests::the_chain_state_is_persisted_beside_the_world stdout ----
+assertion `left == right` failed: the base and the changed-entry thresholds must survive being re-read from disk
+  left: ChainState { base: None, children: [], len: 0, last_backup_ms: 0, last_full_ms: 0 }
+ right: ChainState { base: Some(...), children: [...], len: 2, last_backup_ms: 9000, last_full_ms: 1000 }
+
+test result: FAILED. 59 passed; 9 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+```
+
+Green: **68 passed, 0 failed** (39 `runtime`, 12 `support`, 17 `zip`) — `sdk-test.log`; clippy
+`-D warnings` 0 warnings (`sdk-clippy.log`); `fmt --check` clean (`sdk-fmt.log`).
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices
+
+### Package 0.2.7
+
+| | |
+|---|---|
+| version | **0.2.7** (`horizon-mod.toml` + `Cargo.toml`) |
+| bytes | **60,637 B** |
+| sha256 | `f02f1aa1786e5b0d141ec4bed2e94535498a60c4bc600e4dc1a2a4af595f9656` |
+| entries | **10** — `horizon-mod.toml`, `Cargo.toml`, `LICENSE`, `LICENSE-NOTICE.md`, `README.md`, `src/{lib,runtime,support,zip}.rs`, `uses.json`; **no `Cargo.lock`** |
+| reproducible | two builds, each after `rm -f Cargo.lock`: `cmp` identical, same sha |
+| `check` | `simplebackups 0.2.7 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, 60,637 B, exit 0 |
+| `fits --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `0a875da  made for` |
+| `fits --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `0b14f8a  fits` — the real gate |
+| tests | **68 passed, 0 failed** |
+| `verify-sdk-package.py simplebackups` | `1/1`, `package matches the tree`, R9 clean |
+
+**In game (launcher build `native-0a875da-d16da12df046`, `Compiling simplebackups (1 of 1)`;
+every packed source byte-identical to this tree — `../_shared/evidence/simplebackups-e2e/build-record.txt`).**
+Scenario K's transcript (`e2e-launcher.log`):
+
+```
+full base: …/SimpleBackupsChain_2026-11-24_06-46-22.zip
+base manifest: kind=full chain=SimpleBackupsChain_2026-11-24_06-46-22.zip len=1
+child backup: …/SimpleBackupsChain_2026-11-24_06-46-22-1.zip
+child manifest: chain=SimpleBackupsChain_2026-11-24_06-46-22.zip kind=child len=2 changed=SimpleBackupsChain/changed-marker.txt
+the child carries only the changed entry; the base and the change are in the manifest
+status: saves=0 retries=0 stale=false paused=false ticks=27 chain=2
+list: SimpleBackupsChain_2026-11-24_06-46-22-1.zip (579 B)
+      SimpleBackupsChain_2026-11-24_06-46-22.zip (4.1 KB)
+merged archive: 8 entries, kind=full
+merge folded the chain into one standalone archive
+fresh-world first backup: …/SimpleBackupsChainFresh_2026-11-24_06-46-35.zip
+fresh-world manifest: kind=full chain=SimpleBackupsChainFresh_2026-11-24_06-46-35.zip len=1
+fresh-world status: saves=0 retries=0 stale=false paused=false ticks=6 chain=1
+fresh-world differential: the first backup is full with chain=1
+PASS: … scenario K …
+EXIT:0
+```
+
+The scene is fail-capable: `SELFTEST=chain` (`e2e-launcher-chain-selftest.log`) inverts the base
+assertion and ends `FAIL: CHAIN SELFTEST: the child manifest named the base (…) — the assertion is
+alive` + `EXIT:1`. To keep "only the changed entry" deterministic in a live game, the chain config
+sets `ignored_paths = ["dimensions", "region"]`: the game writes region/POI files between the two
+backups, and a world file outside those volatile subtrees (`changed-marker.txt`) is the one the
+child carries. Every earlier leg stayed green on the 0.2.7 game: `PASS` + `EXIT:0` (scenarios
+A–K); control `EXIT:1`; `SELFTEST=1`, `SELFTEST=pause`, `SELFTEST=ticks`, `SELFTEST=chain`,
+`STALE_SELFTEST=1`, `ADOPT_NEGATIVE=1`, `SAME_SECOND_NEGATIVE=1` all `EXIT:1`.
+`check-e2e-logs.py simplebackups-e2e --strict` → `logs=10 ok=10 missing-exit=0 bad-exit=0`.
+Two harness flakes were hardened in `tools/e2e.sh` (no code change): scenario I's unguarded
+`grep -m1 'saves='` now uses the retrying `newest_status_line`, and scenario J's counter sample
+retries until it lands mid-interval (a busy box can advance the headless counter a full interval
+during one zip check).
+
+### Changelog (0.2.7)
+
+> **0.2.7 — incremental chains and merge.** With `backup_type = "incremental"` the first backup
+> becomes a full base and each later one carries only files modified since the previous backup;
+> `"differential"` compares against the last full. Each archive's `simplebackups.json` keeps the
+> `simplebackups/1` identity and gains the base name, the kind, the changed entries and the chain
+> length (upstream's `metadata.json` facts, kept in the archive so the flat retention is untouched).
+> The chain state persists beside the world like the pause flag and the schedule counter, restoring
+> across restarts (upstream's `BackupData`). `status` reports `chain=<n>`; `/simplebackups merge`
+> folds a chain into one standalone archive. The default `backup_type` is `"full"`, so existing
+> behaviour is unchanged. Regex ignores stay out of scope (R9). 68 tests; scenario K proves the
+> base/changed-entry rule, `chain=2`, `list`, merge and the fresh-world `chain=1` differential in
+> game. 60,637 B, sha256 `f02f1aa1…`.
+
 ## Verification (re-pin `83ad384f`, 2026-11-06/07)
 
 
@@ -827,9 +974,11 @@ works while disabled`.
   backup is written beside the world and restored when it opens, so a restart resumes the interval
   instead of starting at zero. Only tick-mode progress is stored; a wall-clock interval still starts
   at world open (the game's own wall clock is not available through the SDK). Empty-server policy,
-  `latest.log` capture, incremental/chains/merge, Cherished Worlds/mc2discord and regex ignores stay
-  deferred. The disk cap (slice 2), `pause`/`unpause` (slice 5) and the persisted counter (slice 6)
-  are now ported.
+  `latest.log` capture, Cherished Worlds/mc2discord and regex ignores stay deferred. The disk cap
+  (slice 2), `pause`/`unpause` (slice 5), the persisted counter (slice 6) and incremental
+  chains/merge (slice 7) are now ported. Chain children are not standalone restore points; the flat
+  retention (slice 3/4) still prunes by archive identity and is not chain-aware — deliberately
+  unchanged, so an operator can keep a full base by setting `keep` above the chain length.
 - Retention prunes after success (upstream deletes before creating), only archives the port can
   identify as its own (a manifest since 0.2.3; a marker-less 0.2.0–0.2.2 archive only after an
   operator's `/simplebackups adopt <file>`), and after a stale copy it prunes nothing at all; all
@@ -1068,10 +1217,11 @@ remote runner. Evidence in `../_shared/evidence/simplebackups/`.
    pinned compressor crate (or ships a `deflate` helper) closes it.
 3. **The 0.1.0 harness logs are gone** (`target/horizon-test.log`, `target/G9-e2e.log` lived in
    `target/`, which the disk-hygiene rule cleans); the transcript quoted in this file is the record.
-4. Still deferred: incremental/chains/merge, `latest.log` capture, the empty-server policy,
-   Cherished Worlds/mc2discord and regex ignores (**the disk cap is done — *Slice 2 (0.2.2)* —,
-   pause/unpause — *Slice 5 (0.2.5)* —, and the persisted tick schedule — *Slice 6 (0.2.6)*; only
-   the regex half of the old combined gap remains, and R9 forbids the crate it would need**).
+4. Still deferred: `latest.log` capture, the empty-server policy, Cherished Worlds/mc2discord and
+   regex ignores (**the disk cap is done — *Slice 2 (0.2.2)* —, pause/unpause — *Slice 5 (0.2.5)* —,
+   the persisted tick schedule — *Slice 6 (0.2.6)* —, and incremental chains/merge — *Slice 7
+   (0.2.7)*; only the regex half of the old combined gap remains, and R9 forbids the crate it
+   would need**).
 5. `/simplebackups status` is the only route for a config warning; there is no log file.
 6. `side = "both"`, so the mod is installed on a client too; that is required for single player and
    a LAN host (their integrated server belongs to the client installation).

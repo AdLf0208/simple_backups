@@ -1,15 +1,17 @@
 id = "simplebackups"
 name = "Simple Backups"
-version = "0.2.6"
+version = "0.2.7"
 description = """Scheduled, on-disk backups of the whole world, with retention. A backup saves the open
 world, then a worker thread walks the world folder into a .zip.part, publishes it as a .zip and
 prunes the oldest ones down to keep. A copy a save cycle overlapped is thrown away and redone. The
 schedule is a game-tick interval or a wall-clock minute interval; the commands are
-/simplebackups backup|status|list|pause|unpause and /simplebackups adopt <file> at permission level
-2. Pause suppresses only the schedule and persists beside the world; a manual backup still runs.
-The tick counter also persists beside the world, so a restart resumes the interval instead of
-restarting it. Retention deletes only archives the port marked itself, or a marker-less one an
-operator adopted."""
+/simplebackups backup|status|list|pause|unpause|merge and /simplebackups adopt <file> at permission
+level 2. Pause suppresses only the schedule and persists beside the world; a manual backup still
+runs. The tick counter also persists beside the world, so a restart resumes the interval instead of
+restarting it. With backup_type = "incremental" or "differential" the first backup is a full base
+and later ones carry only changed files, with a manifest naming the base and the changed entries;
+/simplebackups merge folds a chain into one standalone archive. Retention deletes only archives the
+port marked itself, or a marker-less one an operator adopted."""
 authors = ["ChaoticTrials", "AdLf0208"]
 license = "Apache-2.0"
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,

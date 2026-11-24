@@ -14,6 +14,7 @@
 //! 4. The worker walks the world folder into `<world>_<UTC>.zip.part` with [`crate::zip`], the
 //!    tick publishes it and prunes, and a copy a save overlapped is thrown away and redone.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
@@ -27,13 +28,15 @@ use mod_api::{
 };
 
 use crate::runtime::{
-    ADOPTION_FILE, Adoption, Archive, MANIFEST_ENTRY, PAUSE_FILE, SCHEDULE_FILE, Settings,
-    backup_file_name, cap_removals, copy_is_stale, due_by_millis, due_by_ticks, entry_name,
-    format_adoptions, format_paused, format_schedule_ticks, format_size, format_size_setting,
-    is_adopted, manifest, manifest_identifies, parse, parse_adoptions, parse_archive, parse_paused,
-    parse_schedule_ticks, prune, schedule_allowed, schedule_progress, should_skip, to_toml,
+    ADOPTION_FILE, Adoption, Archive, BackupKind, CHAIN_FILE, ChainState, MANIFEST_ENTRY,
+    PAUSE_FILE, SCHEDULE_FILE, Settings, backup_file_name, cap_removals, chain_manifest,
+    changed_threshold, choose_kind, copy_is_stale, due_by_millis, due_by_ticks, entry_changed,
+    entry_name, format_adoptions, format_chain, format_paused, format_schedule_ticks, format_size,
+    format_size_setting, full_timer_due, is_adopted, manifest_identifies, merge_order, parse,
+    parse_adoptions, parse_archive, parse_chain, parse_paused, parse_schedule_ticks, prune,
+    schedule_allowed, schedule_progress, should_skip, to_toml,
 };
-use crate::zip::{ZipWriter, entry_names, read_entry};
+use crate::zip::{ZipWriter, entry_names, read_entry, read_entry_all};
 
 /// The port's config file in the game's `config/` folder: `<mod id>.toml`, which the service
 /// hands to the mod that owns it.
@@ -62,6 +65,20 @@ struct Copy {
     /// The resolved backup folder the part was written in.
     dir: PathBuf,
     bytes: u64,
+    /// The chain decision this copy was made under, carried to publish time.
+    plan: ChainPlan,
+}
+
+/// The chain facts a single copy is planned with (upstream `BackupChain`/`BackupThread`).
+#[derive(Clone, Debug)]
+struct ChainPlan {
+    kind: BackupKind,
+    /// mtime threshold: a full base carries every file, a child only changed ones.
+    threshold: u64,
+    /// The base full backup's name this archive belongs to.
+    base: String,
+    /// This archive's length in the chain (1 for a full base, 2 for its first child).
+    len: usize,
 }
 
 struct Report {
@@ -118,6 +135,8 @@ struct Core {
     over_cap: bool,
     /// Settings lines the parser refused, shown by `/simplebackups status`.
     warnings: Vec<String>,
+    /// Incremental-chain state persisted beside the world (upstream's `BackupData`).
+    chain: ChainState,
 }
 
 /// The session state. `Hooks: Send + Sync`, so it is a `Mutex`, and the macro boxes one
@@ -179,6 +198,7 @@ pub fn on_world_lifecycle(phase: mod_api::WorldPhase) {
     match phase {
         mod_api::WorldPhase::WorldCloseFinal | mod_api::WorldPhase::WorldCloseFailed => {
             persist_schedule(core);
+            persist_chain(core);
             core.world = None;
             core.closing = true;
             abandon_save_wait(core);
@@ -208,6 +228,7 @@ pub fn on_server_stopping() {
     let mut guard = core();
     let core = guard.get_or_insert_with(Core::default);
     persist_schedule(core);
+    persist_chain(core);
     core.closing = true;
     abandon_save_wait(core);
 }
@@ -229,6 +250,7 @@ fn ensure_world(host: &dyn ServerHost) {
         return;
     }
     core.paused = read_paused(&dir);
+    core.chain = read_chain(&dir);
     // Upstream loads `lastSaved` from its `BackupData` SavedData here. We stored the *progress*
     // toward the next backup, so restoring it as `ticks = saved, last_tick = 0` makes the due
     // check fire after the remaining interval instead of restarting it at world open.
@@ -490,7 +512,7 @@ fn start_backup(host: &mut dyn ServerHost, quiet: bool) {
 
 /// Start the worker for the in-flight request: name the file, spawn the copy, tell the players.
 fn begin_copy(host: &mut dyn ServerHost, quiet: bool) {
-    let (cfg, world, name, final_path, backups_prefix) = {
+    let (cfg, world, name, final_path, backups_prefix, plan) = {
         let mut guard = core();
         let Some(core) = guard.as_mut() else {
             return;
@@ -522,17 +544,63 @@ fn begin_copy(host: &mut dyn ServerHost, quiet: bool) {
             .unwrap_or_default();
         let name = backup_file_name(&world_name, now_secs(), &taken);
         let final_path = backup_dir.join(&name);
+        // Upstream's `getChainBackupFilePath`: a full base when there is no chain, when the
+        // config asks for full backups, or when the periodic-full timer is due; otherwise a
+        // child carrying only the entries changed since the threshold.
+        let now = now_ms();
+        let kind = choose_kind(
+            core.cfg.backup_type,
+            core.chain.base.is_some(),
+            full_timer_due(
+                now,
+                core.chain.last_full_ms,
+                core.cfg.full_backup_timer_minutes,
+            ),
+        );
+        let base = match kind {
+            BackupKind::Full => name.clone(),
+            BackupKind::Child => core.chain.base.clone().unwrap_or_else(|| name.clone()),
+        };
+        let len = match kind {
+            BackupKind::Full => 1,
+            BackupKind::Child => core.chain.len.max(1) + 1,
+        };
+        let plan = ChainPlan {
+            kind,
+            threshold: changed_threshold(core.cfg.backup_type, &core.chain),
+            base,
+            len,
+        };
+        // Upstream's `updateSaveTime` runs as soon as the worker starts, so the value just read
+        // as this backup's threshold belongs to the previous one; record THIS start for the next
+        // child. Doing this before the plan above would make a child compare against its own
+        // start and miss every file changed before it.
+        core.chain.last_backup_ms = now;
         core.in_flight = true;
         core.in_flight_quiet = quiet;
         core.save_seq_at_start = core.save_seq;
-        (core.cfg.clone(), world, name, final_path, backups_prefix)
+        (
+            core.cfg.clone(),
+            world,
+            name,
+            final_path,
+            backups_prefix,
+            plan,
+        )
     };
 
     let (tx, rx) = mpsc::channel();
     let worker_cfg = cfg.clone();
     let worker_final = final_path.clone();
+    let worker_plan = plan.clone();
     thread::spawn(move || {
-        let result = run_backup(&world, &worker_final, &worker_cfg, backups_prefix);
+        let result = run_backup(
+            &world,
+            &worker_final,
+            &worker_cfg,
+            backups_prefix,
+            &worker_plan,
+        );
         let _ = tx.send(result);
     });
     {
@@ -555,6 +623,7 @@ fn run_backup(
     final_path: &Path,
     cfg: &Settings,
     backups_prefix: Option<String>,
+    plan: &ChainPlan,
 ) -> Result<Copy, String> {
     let world_name = world_name(world);
     let part = final_path.with_extension("zip.part");
@@ -578,22 +647,40 @@ fn run_backup(
             .open(&part)
             .map_err(|error| error.to_string())?;
         let mut zip = ZipWriter::new(BufWriter::new(file));
-        // The marker every archive carries: retention deletes only an archive whose manifest
-        // names this port and this world, never a ZIP that merely matches the name prefix.
-        let backup_name = final_path
-            .file_name()
-            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
-        let marker = manifest(&world_name, &backup_name);
-        zip.add_bytes(MANIFEST_ENTRY, marker.as_bytes())
-            .map_err(|error| error.to_string())?;
-        walk(
-            &mut zip,
+        // Plan first: a child carries only files whose mtime passed the threshold (upstream's
+        // `lastModified - lastSaved > 0`), so the manifest can name exactly those entries.
+        let entries = planned_entries(
             world,
             "",
             &world_name,
             cfg,
             backups_prefix.as_deref(),
+            plan.threshold,
+            plan.kind == BackupKind::Full,
         )?;
+        let changed: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
+        // The marker every archive carries. It keeps the `simplebackups/1` identity retention
+        // checks, and adds the chain facts that live in upstream's per-chain `metadata.json`.
+        let backup_name = final_path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        let marker = chain_manifest(
+            &world_name,
+            &backup_name,
+            &plan.base,
+            plan.kind,
+            &changed,
+            plan.len,
+        );
+        zip.add_bytes(MANIFEST_ENTRY, marker.as_bytes())
+            .map_err(|error| error.to_string())?;
+        for (entry_name, path) in entries {
+            match zip.add_file(&entry_name, &path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
         let writer = zip.finish().map_err(|error| error.to_string())?;
         let file = writer
             .into_inner()
@@ -615,6 +702,7 @@ fn run_backup(
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
         bytes,
+        plan: plan.clone(),
     })
 }
 
@@ -659,6 +747,22 @@ fn publish(core: &mut Core, copy: &Copy, stale: bool) -> Result<Report, String> 
     core.over_cap = over_cap;
     if stale {
         core.stale = true;
+    } else {
+        // Only a confirmed restore point becomes part of the chain. A stale copy is not one.
+        match copy.plan.kind {
+            BackupKind::Full => {
+                core.chain.base = Some(name.clone());
+                core.chain.children.clear();
+                core.chain.len = 1;
+                core.chain.last_full_ms = now_ms();
+            }
+            BackupKind::Child => {
+                core.chain.base = Some(copy.plan.base.clone());
+                core.chain.len = copy.plan.len;
+                core.chain.children.push(name.clone());
+            }
+        }
+        persist_chain(core);
     }
     Ok(Report {
         name,
@@ -771,6 +875,35 @@ fn persist_schedule(core: &Core) {
     if let Some(world) = &core.world {
         let progress = schedule_progress(core.ticks, core.last_tick);
         let _ = write_schedule_ticks(world, progress);
+    }
+}
+
+/// The persisted chain state lives beside the world, like the pause flag and schedule counter.
+fn chain_path(world: &Path) -> PathBuf {
+    world.join(CHAIN_FILE)
+}
+
+/// Read the chain state when a world opens, the moment upstream loads its `BackupData`
+/// `lastSaved`/`lastFullBackup`. A missing or malformed file means a fresh chain.
+fn read_chain(world: &Path) -> ChainState {
+    fs::read_to_string(chain_path(world))
+        .ok()
+        .and_then(|text| parse_chain(&text))
+        .unwrap_or_default()
+}
+
+/// Persist the chain state with a staged rename, like the pause flag and schedule counter.
+fn write_chain(world: &Path, state: &ChainState) -> io::Result<()> {
+    let path = chain_path(world);
+    let staging = world.join(format!("{CHAIN_FILE}.tmp"));
+    fs::write(&staging, format_chain(state))?;
+    fs::rename(&staging, &path)
+}
+
+/// The in-memory chain state reaches disk after each good publish and on a graceful close.
+fn persist_chain(core: &Core) {
+    if let Some(world) = &core.world {
+        let _ = write_chain(world, &core.chain);
     }
 }
 
@@ -920,16 +1053,21 @@ fn world_name(world: &Path) -> String {
         .unwrap_or_else(|| "world".to_owned())
 }
 
-/// One directory level of the walk: entries in name order, directories first-class, symlinks,
-/// the backups folder and anything the config ignores left out.
-fn walk<W: io::Write + io::Seek>(
-    zip: &mut ZipWriter<W>,
+/// One directory level of the plan: the zip entries and their paths for files that belong in
+/// this archive. Directories are walked in name order; symlinks, the backups folder, the port's
+/// own state files and anything the config ignores are left out. A child keeps only files whose
+/// mtime is strictly newer than the threshold (upstream `lastModified - lastSaved > 0`); a full
+/// base keeps every file.
+fn planned_entries(
     dir: &Path,
     prefix: &str,
     world_name: &str,
     cfg: &Settings,
     backups_prefix: Option<&str>,
-) -> Result<(), String> {
+    threshold: u64,
+    full: bool,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let mut out = Vec::new();
     let mut entries: Vec<_> = fs::read_dir(dir)
         .map_err(|error| error.to_string())?
         .flatten()
@@ -948,30 +1086,39 @@ fn walk<W: io::Write + io::Seek>(
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.to_string()),
         };
-        if metadata.file_type().is_symlink() {
-            continue;
-        }
-        if should_skip(&relative, backups_prefix, cfg) {
+        if metadata.file_type().is_symlink() || should_skip(&relative, backups_prefix, cfg) {
             continue;
         }
         if metadata.is_dir() {
-            walk(zip, &path, &relative, world_name, cfg, backups_prefix)?;
+            out.extend(planned_entries(
+                &path,
+                &relative,
+                world_name,
+                cfg,
+                backups_prefix,
+                threshold,
+                full,
+            )?);
             continue;
         }
         if !metadata.is_file() {
             // A fifo or a socket would block the worker for ever; only files are archived.
             continue;
         }
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        if !entry_changed(modified, threshold, full) {
+            continue;
+        }
         let Some(entry_name) = entry_name(world_name, &relative) else {
             continue;
         };
-        match zip.add_file(&entry_name, &path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.to_string()),
-        }
+        out.push((entry_name, path));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Declares the `/simplebackups` commands (permission level 2).
@@ -987,6 +1134,97 @@ pub fn register_commands(commands: &mut Vec<Command>) {
     commands.push(Command::op("simplebackups unpause", 2));
     // An operator-level action: it is the *only* way a marker-less archive becomes deletable.
     commands.push(Command::op("simplebackups adopt <file:text>", 2));
+    // Upstream's `mergeBackups`: fold a chain into one standalone archive.
+    commands.push(Command::op("simplebackups merge", 2));
+}
+
+/// `/simplebackups merge`: fold the current chain into one full, standalone archive. This is
+/// upstream's `MergeCommand` — the zips it reads are the full base plus the children a
+/// differential chain needs, and per entry name the newest zip wins.
+fn merge_chains() -> Result<String, String> {
+    let (world, cfg, chain) = {
+        let guard = core();
+        let core = guard
+            .as_ref()
+            .ok_or_else(|| "Simple Backups is not initialised.".to_owned())?;
+        let world = core
+            .world
+            .clone()
+            .ok_or_else(|| "No world is open.".to_owned())?;
+        (world, core.cfg.clone(), core.chain.clone())
+    };
+    let base = chain
+        .base
+        .ok_or_else(|| "there is no chain to merge yet".to_owned())?;
+    let dir = owned_dir(&world, cfg.backups_dir())?;
+    let sources = merge_order(cfg.backup_type, &base, &chain.children);
+    let mut merged: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut read_any = false;
+    for source in sources {
+        let path = dir.join(&source);
+        if !path.is_file() {
+            continue;
+        }
+        for name in entry_names(&path).map_err(|error| error.to_string())? {
+            if name == MANIFEST_ENTRY {
+                continue;
+            }
+            if let Some(bytes) = read_entry_all(&path, &name).map_err(|error| error.to_string())? {
+                // Later zips overwrite earlier ones: the newest version of each entry wins.
+                merged.insert(name, bytes);
+                read_any = true;
+            }
+        }
+    }
+    if !read_any {
+        return Err("none of the chain's archives are on disk".to_owned());
+    }
+    let name = format!("merged_backup-{}.zip", now_secs());
+    let final_path = dir.join(&name);
+    let part = final_path.with_extension("zip.part");
+    let changed: Vec<String> = merged.keys().cloned().collect();
+    let marker = chain_manifest(
+        &world_name(&world),
+        &name,
+        &name,
+        BackupKind::Full,
+        &changed,
+        1,
+    );
+    let result = (|| -> Result<(), String> {
+        match fs::symlink_metadata(&part) {
+            Ok(meta) if meta.is_file() || meta.file_type().is_symlink() => {
+                fs::remove_file(&part).map_err(|error| error.to_string())?;
+            }
+            Ok(_) => return Err(format!("staging path {} is not a file", part.display())),
+            Err(_) => {}
+        }
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+            .map_err(|error| error.to_string())?;
+        let mut zip = ZipWriter::new(BufWriter::new(file));
+        zip.add_bytes(MANIFEST_ENTRY, marker.as_bytes())
+            .map_err(|error| error.to_string())?;
+        for (entry_name, bytes) in &merged {
+            zip.add_bytes(entry_name, bytes)
+                .map_err(|error| error.to_string())?;
+        }
+        let writer = zip.finish().map_err(|error| error.to_string())?;
+        writer
+            .into_inner()
+            .map_err(|error| error.error().to_string())?
+            .sync_all()
+            .map_err(|error| error.to_string())?;
+        fs::rename(&part, &final_path).map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&part);
+        return Err(error);
+    }
+    Ok(format!("merged {} entries into {name}", merged.len()))
 }
 
 /// Flip the persisted pause flag and report what is now in force. The flag is written to the
@@ -1074,6 +1312,10 @@ pub fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) ->
             let reply = adopt_file(&file).unwrap_or_else(|error| format!("Adopt failed: {error}"));
             let _ = host.commands().feedback(Text::literal(reply));
         }
+        ["simplebackups", "merge"] => {
+            let reply = merge_chains().unwrap_or_else(|error| format!("Merge failed: {error}"));
+            let _ = host.commands().feedback(Text::literal(reply));
+        }
         _ => return Flow::Continue,
     }
     Flow::Cancel
@@ -1113,12 +1355,13 @@ fn status_lines() -> Vec<String> {
     // stay valid. `ticks` is the persisted progress toward the next scheduled backup: a parsed
     // reply after a restart proves the counter resumed instead of restarting at zero.
     lines.push(format!(
-        "saves={} retries={} stale={} paused={} ticks={}",
+        "saves={} retries={} stale={} paused={} ticks={} chain={}",
         core.save_seq,
         core.retries,
         core.stale,
         core.paused,
-        schedule_progress(core.ticks, core.last_tick)
+        schedule_progress(core.ticks, core.last_tick),
+        core.chain.len
     ));
     // The disk cap is a config key of its own, so it gets a line of its own: the folder's size after
     // the last publish, the cap it is measured against, and whether it is still over it. The
@@ -1224,6 +1467,30 @@ mod tests {
     }
 
     #[test]
+    fn the_chain_state_is_persisted_beside_the_world() {
+        let world = scratch_world("chain-state");
+        assert_eq!(read_chain(&world), ChainState::default());
+        let state = ChainState {
+            base: Some("World_2026-01-01_00-00-00.zip".to_owned()),
+            children: vec!["World_2026-01-01_00-00-01.zip".to_owned()],
+            len: 2,
+            last_backup_ms: 9_000,
+            last_full_ms: 1_000,
+        };
+        write_chain(&world, &state).expect("write the chain state");
+        assert_eq!(
+            read_chain(&world),
+            state,
+            "the base and the changed-entry thresholds must survive being re-read from disk"
+        );
+        assert!(
+            !world.join(format!("{CHAIN_FILE}.tmp")).exists(),
+            "the staging file must be renamed away"
+        );
+        cleanup(&world);
+    }
+
+    #[test]
     fn the_schedule_counter_is_persisted_beside_the_world() {
         let world = scratch_world("schedule-counter");
         assert_eq!(
@@ -1250,6 +1517,16 @@ mod tests {
             keep,
             max_disk_bytes: cap,
             ..Settings::default()
+        }
+    }
+
+    /// A full-base chain plan for the retention tests: they check identity and pruning, not chains.
+    fn full_plan() -> ChainPlan {
+        ChainPlan {
+            kind: BackupKind::Full,
+            threshold: 0,
+            base: "World_2026-01-01_00-00-00.zip".to_owned(),
+            len: 1,
         }
     }
 
@@ -1299,6 +1576,7 @@ mod tests {
             &backups.join("World_2026-01-01_00-00-00.zip"),
             &cfg,
             Some("backups".to_owned()),
+            &full_plan(),
         )
         .expect("the first copy");
         publish(&mut core_with(&world, cfg.clone()), &first, false).expect("publish first");
@@ -1307,6 +1585,7 @@ mod tests {
             &backups.join("World_2026-01-01_00-00-01.zip"),
             &cfg,
             Some("backups".to_owned()),
+            &full_plan(),
         )
         .expect("the second copy");
         publish(&mut core_with(&world, cfg.clone()), &second, false).expect("publish second");
@@ -1321,6 +1600,7 @@ mod tests {
             &backups.join("World_2026-01-01_00-00-02.zip"),
             &cfg,
             Some("backups".to_owned()),
+            &full_plan(),
         )
         .expect("the stale copy");
         let report = publish(&mut core_with(&world, cfg), &stale, true).expect("publish stale");
@@ -1361,6 +1641,7 @@ mod tests {
             &backups.join("World_2026-01-01_00-00-00.zip"),
             &cfg,
             Some("backups".to_owned()),
+            &full_plan(),
         )
         .expect("the old copy");
         publish(&mut core_with(&world, cfg.clone()), &old, false).expect("publish old");
@@ -1369,6 +1650,7 @@ mod tests {
             &backups.join("World_2026-01-01_00-00-01.zip"),
             &cfg,
             Some("backups".to_owned()),
+            &full_plan(),
         )
         .expect("the new copy");
         publish(&mut core_with(&world, cfg), &new, false).expect("publish new");
@@ -1411,6 +1693,7 @@ mod tests {
             &backups.join("World_2026-01-01_00-00-00.zip"),
             &cfg,
             Some("backups".to_owned()),
+            &full_plan(),
         )
         .expect("the first copy");
         publish(&mut core_with(&world, cfg.clone()), &first, false).expect("publish first");
@@ -1419,6 +1702,7 @@ mod tests {
             &backups.join("World_2026-01-01_00-00-01.zip"),
             &cfg,
             Some("backups".to_owned()),
+            &full_plan(),
         )
         .expect("the second copy");
         publish(&mut core_with(&world, cfg), &second, false).expect("publish second");
@@ -1442,6 +1726,7 @@ mod tests {
             &backups.join("World_2026-01-01_00-00-00-9.zip"),
             &Settings::default(),
             Some("backups".to_owned()),
+            &full_plan(),
         )
         .expect("the seed archive");
         publish(
@@ -1455,6 +1740,7 @@ mod tests {
             &backups.join("World_2026-01-01_00-00-00.zip"),
             &Settings::default(),
             Some("backups".to_owned()),
+            &full_plan(),
         )
         .expect("the fresh copy");
         // keep = 1 and a 1 B cap both want to delete the oldest archive of that second.
@@ -1491,6 +1777,7 @@ mod tests {
             &backups.join("World_2026-01-01_00-00-00.zip"),
             &cfg,
             Some("backups".to_owned()),
+            &full_plan(),
         )
         .expect("the first copy");
         publish(&mut core_with(&world, cfg.clone()), &first, false).expect("publish first");
@@ -1518,6 +1805,7 @@ mod tests {
             &backups.join("World_2026-01-01_00-00-01.zip"),
             &cfg,
             Some("backups".to_owned()),
+            &full_plan(),
         )
         .expect("the second copy");
         publish(&mut core_with(&world, cfg), &second, false).expect("publish second");
@@ -1566,6 +1854,7 @@ mod tests {
             &final_path,
             &Settings::default(),
             Some("backups".to_owned()),
+            &full_plan(),
         );
 
         assert!(
@@ -1614,6 +1903,7 @@ mod tests {
             &backups.join(older_name),
             &cfg,
             Some("backups".to_owned()),
+            &full_plan(),
         )
         .expect("older archive");
         publish(&mut core_with(&world, cfg.clone()), &older, false).expect("publish older");
@@ -1622,6 +1912,7 @@ mod tests {
             &backups.join(newer_name),
             &cfg,
             Some("backups".to_owned()),
+            &full_plan(),
         )
         .expect("newer archive");
         publish(&mut core_with(&world, cfg.clone()), &newer, false).expect("publish newer");
@@ -1664,6 +1955,7 @@ mod tests {
             &backups.join(ours_name),
             &cfg,
             Some("backups".to_owned()),
+            &full_plan(),
         )
         .expect("our copy");
         publish(&mut core_with(&world, cfg.clone()), &ours, false).expect("publish ours");

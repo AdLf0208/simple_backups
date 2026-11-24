@@ -27,11 +27,11 @@ use mod_api::{
 };
 
 use crate::runtime::{
-    ADOPTION_FILE, Adoption, Archive, MANIFEST_ENTRY, PAUSE_FILE, Settings, backup_file_name,
-    cap_removals, copy_is_stale, due_by_millis, due_by_ticks, entry_name, format_adoptions,
-    format_paused, format_size, format_size_setting, is_adopted, manifest, manifest_identifies,
-    parse, parse_adoptions, parse_archive, parse_paused, prune, schedule_allowed, should_skip,
-    to_toml,
+    ADOPTION_FILE, Adoption, Archive, MANIFEST_ENTRY, PAUSE_FILE, SCHEDULE_FILE, Settings,
+    backup_file_name, cap_removals, copy_is_stale, due_by_millis, due_by_ticks, entry_name,
+    format_adoptions, format_paused, format_schedule_ticks, format_size, format_size_setting,
+    is_adopted, manifest, manifest_identifies, parse, parse_adoptions, parse_archive, parse_paused,
+    parse_schedule_ticks, prune, schedule_allowed, schedule_progress, should_skip, to_toml,
 };
 use crate::zip::{ZipWriter, entry_names, read_entry};
 
@@ -178,6 +178,7 @@ pub fn on_world_lifecycle(phase: mod_api::WorldPhase) {
     let core = guard.get_or_insert_with(Core::default);
     match phase {
         mod_api::WorldPhase::WorldCloseFinal | mod_api::WorldPhase::WorldCloseFailed => {
+            persist_schedule(core);
             core.world = None;
             core.closing = true;
             abandon_save_wait(core);
@@ -206,6 +207,7 @@ fn abandon_save_wait(core: &mut Core) {
 pub fn on_server_stopping() {
     let mut guard = core();
     let core = guard.get_or_insert_with(Core::default);
+    persist_schedule(core);
     core.closing = true;
     abandon_save_wait(core);
 }
@@ -227,8 +229,12 @@ fn ensure_world(host: &dyn ServerHost) {
         return;
     }
     core.paused = read_paused(&dir);
+    // Upstream loads `lastSaved` from its `BackupData` SavedData here. We stored the *progress*
+    // toward the next backup, so restoring it as `ticks = saved, last_tick = 0` makes the due
+    // check fire after the remaining interval instead of restarting it at world open.
+    let restored = read_schedule_ticks(&dir);
     core.world = Some(dir);
-    core.ticks = 0;
+    core.ticks = restored;
     core.last_tick = 0;
     core.last_ms = now_ms();
     core.closing = false;
@@ -252,6 +258,9 @@ pub fn on_world_saved(host: &mut dyn ServerHost, _wait: bool) {
             return;
         };
         core.save_seq = core.save_seq.wrapping_add(1);
+        // A save is upstream's checkpoint moment: `lastSaved` lives in a SavedData the game writes
+        // on the same cycle, so snapshotting progress here makes a crash-safe restart possible too.
+        persist_schedule(core);
         core.waiting_save.take()
     };
     if let Some(quiet) = waiting {
@@ -732,6 +741,39 @@ fn write_paused(world: &Path, paused: bool) -> io::Result<()> {
     fs::rename(&staging, &path)
 }
 
+/// The persisted schedule counter lives beside the world, like the pause flag: a folder a user may
+/// delete without expecting the schedule to reset to world open.
+fn schedule_path(world: &Path) -> PathBuf {
+    world.join(SCHEDULE_FILE)
+}
+
+/// Read the tick counter when a world opens, the moment upstream loads `lastSaved` from its
+/// `BackupData` SavedData. A missing or malformed file means a fresh interval.
+fn read_schedule_ticks(world: &Path) -> u64 {
+    fs::read_to_string(schedule_path(world))
+        .ok()
+        .and_then(|text| parse_schedule_ticks(&text))
+        .unwrap_or(0)
+}
+
+/// Write the counter with a staged rename, like the pause flag and the adoption journal, so a
+/// crash cannot leave a half-written number that parses as a fresh schedule.
+fn write_schedule_ticks(world: &Path, ticks: u64) -> io::Result<()> {
+    let path = schedule_path(world);
+    let staging = world.join(format!("{SCHEDULE_FILE}.tmp"));
+    fs::write(&staging, format_schedule_ticks(ticks))?;
+    fs::rename(&staging, &path)
+}
+
+/// Persist the progress the tick has reached. Called on each save (upstream saves `lastSaved`
+/// with its `BackupData`) and on a graceful close/stop, so a restart resumes the interval.
+fn persist_schedule(core: &Core) {
+    if let Some(world) = &core.world {
+        let progress = schedule_progress(core.ticks, core.last_tick);
+        let _ = write_schedule_ticks(world, progress);
+    }
+}
+
 /// An operator's `/simplebackups adopt <file>`: record a legacy archive (one written before the
 /// manifest existed) as this world's, so retention may delete it.
 ///
@@ -1067,10 +1109,16 @@ fn status_lines() -> Vec<String> {
         core.last_completed.as_deref().unwrap_or("-"),
         core.last_error.as_deref().unwrap_or("-")
     ));
-    // `paused` is appended so the earlier substring assertions (saves=/retries=/stale=) stay valid.
+    // `paused`/`ticks` are appended so the earlier substring assertions (saves=/retries=/stale=)
+    // stay valid. `ticks` is the persisted progress toward the next scheduled backup: a parsed
+    // reply after a restart proves the counter resumed instead of restarting at zero.
     lines.push(format!(
-        "saves={} retries={} stale={} paused={}",
-        core.save_seq, core.retries, core.stale, core.paused
+        "saves={} retries={} stale={} paused={} ticks={}",
+        core.save_seq,
+        core.retries,
+        core.stale,
+        core.paused,
+        schedule_progress(core.ticks, core.last_tick)
     ));
     // The disk cap is a config key of its own, so it gets a line of its own: the folder's size after
     // the last publish, the cap it is measured against, and whether it is still over it. The
@@ -1172,6 +1220,27 @@ mod tests {
         );
         write_paused(&world, false).expect("clear the paused flag");
         assert!(!read_paused(&world), "unpause must be persisted too");
+        cleanup(&world);
+    }
+
+    #[test]
+    fn the_schedule_counter_is_persisted_beside_the_world() {
+        let world = scratch_world("schedule-counter");
+        assert_eq!(
+            read_schedule_ticks(&world),
+            0,
+            "a world with no state file starts a fresh interval"
+        );
+        write_schedule_ticks(&world, 17).expect("write the schedule counter");
+        assert_eq!(
+            read_schedule_ticks(&world),
+            17,
+            "the counter must survive being re-read from disk"
+        );
+        assert!(
+            !world.join(format!("{SCHEDULE_FILE}.tmp")).exists(),
+            "the staging file must be renamed away"
+        );
         cleanup(&world);
     }
 

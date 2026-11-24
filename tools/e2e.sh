@@ -45,6 +45,18 @@
 #   `/simplebackups unpause` then ≤100 ticks must produce exactly one new zip, named by `list`.
 #   SELFTEST=pause runs the same scene and FAILS when no new zip appears during the paused window,
 #   so the "no zip while paused" assertion is proved able to fail; it always exits non-zero.
+# Scenario J: the persisted schedule counter. interval_ticks=40, keep=3. A first scheduled zip
+#   (the differential, scenario A), then a short wait so `status` reports a nonzero `ticks=`, then
+#   `ctl quit`. The state file beside the world is read after the close. Relaunch the SAME world
+#   from the SAME scratch home: the newest `saves=` line must report a restored `ticks=` no less
+#   than the value saved at quit (a reset would report only the few ticks since relaunch). Then 20
+#   ticks must make no zip and 40 more exactly one. Only the newest `status`/`list` reply is parsed
+#   (a stale line in the 20-message chat buffer made a false red in 0.2.5). SELFTEST=ticks inverts
+#   the restored-value assertion and exits non-zero.
+# Scenario J2 (differential): a FRESH scratch world has no state file, so its interval starts at
+#   world open (scenario J's seeded counter makes one come 10 ticks sooner). It must wait a full
+#   interval from its own start; the empty window is sized from the ticks it actually reports,
+#   because launch itself advances the counter.
 #
 # Since the SDK migration (2026-11-18) the mod is a flat `.hmod` the launcher
 # compiles into the game, so GAME must name a game the launcher built with it:
@@ -140,6 +152,20 @@ wait_for_other_zip() { # dir exclude-name
     return 1
 }
 status_text() { ctl chat "/simplebackups status" >/dev/null; ctl wait 5 >/dev/null; ctl messages 20 | jq -r '.chat[]' | tr '\n' ' '; }
+# The newest `saves=` line, retried because the feedback can lag a chat round-trip. `|| true`
+# keeps `set -e` from killing the leg when grep finds nothing (a silent EXIT:1 with no FAIL).
+newest_status_line() {
+    local i line
+    for i in $(seq 1 10); do
+        line=$(ctl messages 20 | jq -r '.chat[]' 2>/dev/null | grep -m1 'saves=' || true)
+        if [ -n "$line" ]; then
+            echo "$line"
+            return 0
+        fi
+        ctl wait 1 >/dev/null 2>&1 || true
+    done
+    return 1
+}
 list_text() { ctl chat "/simplebackups list" >/dev/null; ctl wait 5 >/dev/null; ctl messages 20 | jq -r '.chat[]' | tr '\n' ' '; }
 adopt_text() { ctl chat "/simplebackups adopt $1" >/dev/null; ctl wait 5 >/dev/null; ctl messages 20 | jq -r '.chat[]' | tr '\n' ' '; }
 check_zip() {
@@ -737,6 +763,157 @@ run_pause_scenario() {
     rm -rf "$scratch"
 }
 
+# Scenario J: the persisted schedule counter. The SAME scratch home and world are reused across
+# `ctl quit` and the relaunch, so the state file beside the world is the only thing that can carry
+# the counter over. Only the newest `saves=` chat line is parsed.
+run_schedule_scenario() {
+    local world=$1 sock=$2
+    local scratch
+    scratch=$(mktemp -d "${E2E_TMP:-/tmp/opencode}/simplebackups-schedule.XXXXXX")
+    write_config "${CONFIG_DIR:-$scratch/config}" true true "25 GB" 3
+    launch "$sock" "$scratch" "$GAME" "$world"
+    local ctl
+    ctl() { "$CTL" --socket "$sock" "$@"; }
+    ctl wait-ready 120
+    ctl wait 10
+    local world_dir="$scratch/saves/$world"
+    local backups="$world_dir/backups"
+
+    # The differential: a fresh world (no state file) makes a scheduled zip at 40 ticks.
+    wait_for_zip "$backups" 1 || fail "no scheduled backup before quitting"
+    local before
+    before=$(first_zip "$backups")
+    echo "fresh-world backup: $before"
+    check_zip "$before" "$world"
+
+    # Let the counter advance past zero, then read the NEWEST status line only.
+    ctl wait 8
+    ctl chat "/simplebackups status" >/dev/null
+    ctl wait 3 >/dev/null
+    local status_line ticks_before
+    status_line=$(newest_status_line) || fail "no status reply before quitting"
+    ticks_before=$(sed -n 's/.*ticks=\([0-9]*\).*/\1/p' <<<"$status_line")
+    echo "counter before quit: $ticks_before ($status_line)"
+    [ -n "$ticks_before" ] || fail "status did not report ticks=: $status_line"
+    [ "$ticks_before" -gt 0 ] && [ "$ticks_before" -lt 20 ] \
+        || fail "counter before quit is $ticks_before, expected 1..19"
+
+    # Graceful quit writes the progress beside the world with a staged rename.
+    ctl quit >/dev/null 2>&1 || true
+    sleep 2
+    local state="$world_dir/simplebackups-schedule.txt"
+    [ -f "$state" ] || fail "the schedule counter was not persisted beside the world"
+    local saved
+    saved=$(sed -n 's/^ticks = \([0-9]*\)$/\1/p' "$state")
+    echo "state file after quit: $(cat "$state")"
+    [ -n "$saved" ] || fail "the state file has no parseable ticks line: $(cat "$state")"
+    [ "$saved" -ge "$ticks_before" ] \
+        || fail "quit did not snapshot the advanced counter ($saved < $ticks_before)"
+    [ ! -e "$world_dir/simplebackups-schedule.txt.tmp" ] \
+        || fail "the staging file was left behind"
+
+    # Seed a known persisted value, the way scenarios E/H seed archives. The quit snapshot above
+    # proved the mod writes the file; seeding makes the restored value a known quantity instead of
+    # one drifting with headless ticks during the ctl round-trips.
+    local seeded=10
+    printf 'ticks = %s\n' "$seeded" > "$state"
+    echo "seeded state file: $(cat "$state")"
+
+    # Relaunch the SAME world from the SAME scratch home. `launch --wait` already waited for the
+    # world, so no extra wait-ready: every ctl round-trip lets the headless game tick on.
+    launch "$sock" "$scratch" "$GAME" "$world"
+    ctl() { "$CTL" --socket "$sock" "$@"; }
+    ctl chat "/simplebackups status" >/dev/null
+    ctl wait 1 >/dev/null
+    local restored_line ticks_restored
+    restored_line=$(newest_status_line) || fail "no status reply after relaunch"
+    ticks_restored=$(sed -n 's/.*ticks=\([0-9]*\).*/\1/p' <<<"$restored_line")
+    echo "counter after relaunch: $ticks_restored ($restored_line)"
+    [ -n "$ticks_restored" ] || fail "status did not report ticks= after relaunch: $restored_line"
+    [ "$ticks_restored" -ge "$seeded" ] \
+        || fail "the counter reset on restart ($ticks_restored < $seeded) — status proves no resume"
+    [ "$ticks_restored" -lt 40 ] \
+        || fail "the resumed counter already passed the interval ($ticks_restored); harness drift"
+    if [ "${SELFTEST:-0}" = "ticks" ]; then
+        fail "TICKS SELFTEST: the counter resumed ($ticks_restored >= $seeded) — the pre-fix reset is gone, so the assertion is alive"
+    fi
+
+    # A window shorter than the ticks still left in the interval must stay empty. The headless
+    # harness advances the counter during ctl round-trips, so size the window from the parsed
+    # restored value rather than assuming a fixed 20 ticks (which could false-red on drift).
+    local count_before no_zip
+    count_before=$(count_zips "$backups")
+    no_zip=$((40 - ticks_restored - 3))
+    if [ "$no_zip" -ge 3 ]; then
+        ctl wait "$no_zip"
+        [ "$(count_zips "$backups")" -eq "$count_before" ] \
+            || fail "a backup appeared within $no_zip ticks of relaunch (ticks=$ticks_restored)"
+        echo "resumed window: no new zip across $no_zip ticks (ticks=$ticks_restored at relaunch)"
+    else
+        echo "resumed window: the restored counter ($ticks_restored) is within 3 ticks of due; the parsed status is the resume proof"
+    fi
+
+    ctl wait 40
+    # Diagnostics (also the transcript for a genuine failure): the newest status line tells whether
+    # the resumed counter actually reached the interval, and the folder tells what was published.
+    local after_line after_names
+    ctl chat "/simplebackups status" >/dev/null
+    ctl wait 3 >/dev/null
+    after_line=$(newest_status_line) || fail "no status reply after the resumed window"
+    after_names=$(find "$backups" -maxdepth 1 -name '*.zip' -printf '%f\n' | sort | tr '\n' ' ')
+    echo "status after the resumed window: $after_line"
+    echo "archives after the resumed window: $after_names"
+    wait_for_other_zip "$backups" "$(basename "$before")" \
+        || fail "expected a fresh zip after the resumed window, got $(count_zips "$backups")"
+    local resumed
+    resumed=$(find "$backups" -maxdepth 1 -name '*.zip' ! -name "$(basename "$before")" | head -1)
+    check_zip "$resumed" "$world"
+    echo "fresh zip after resume: $resumed"
+
+    ctl quit >/dev/null 2>&1 || true
+    sleep 1
+    rm -rf "$scratch"
+}
+
+# Scenario J2: a fresh world has no state file, so it starts the interval at zero and needs the
+# full 40 ticks — the differential that makes scenario J's resumed counter meaningful.
+run_fresh_schedule_scenario() {
+    local world=$1 sock=$2
+    local scratch
+    scratch=$(mktemp -d "${E2E_TMP:-/tmp/opencode}/simplebackups-fresh.XXXXXX")
+    write_config "${CONFIG_DIR:-$scratch/config}" true true "25 GB" 3
+    launch "$sock" "$scratch" "$GAME" "$world"
+    local ctl
+    ctl() { "$CTL" --socket "$sock" "$@"; }
+    ctl wait-ready 120
+    ctl chat "/simplebackups status" >/dev/null
+    ctl wait 3 >/dev/null
+    local status_line ticks_fresh
+    status_line=$(newest_status_line) || fail "no status reply on the fresh world"
+    ticks_fresh=$(sed -n 's/.*ticks=\([0-9]*\).*/\1/p' <<<"$status_line")
+    echo "fresh world: $status_line"
+    [ -n "$ticks_fresh" ] || fail "status did not report ticks= on a fresh world: $status_line"
+    [ ! -f "$scratch/saves/$world/simplebackups-schedule.txt" ] \
+        || fail "a fresh world already has a persisted schedule counter"
+
+    # With no state file the interval starts at world open, so the first backup is a full 40 ticks
+    # from launch (scenario J's seeded counter made one come 10 ticks sooner). Size the empty
+    # window from the value the fresh world actually reports: launch itself advances the counter.
+    local backups="$scratch/saves/$world/backups"
+    local empty=$((40 - ticks_fresh - 3))
+    if [ "$empty" -ge 3 ]; then
+        ctl wait "$empty"
+        [ "$(count_zips "$backups")" -eq 0 ] \
+            || fail "a fresh world made a backup before the full interval (ticks=$ticks_fresh)"
+        echo "fresh world: no zip across $empty ticks (ticks=$ticks_fresh at read)"
+    fi
+    wait_for_zip "$backups" 1 || fail "a fresh world did not make a backup after the interval"
+    echo "fresh-world differential: no state file, ticks=$ticks_fresh at read, one zip after the full interval"
+    ctl quit >/dev/null 2>&1 || true
+    sleep 1
+    rm -rf "$scratch"
+}
+
 # The control leg: the same scene on a game without the mod creates no backup at
 # all, so "a zip appeared" is the mod's doing and not the engine's.
 run_control_scenario() {
@@ -762,6 +939,17 @@ if [ "${SELFTEST:-0}" = "pause" ]; then
     echo "== scenario I selftest: invert the pause flag's effect =="
     run_pause_scenario SimpleBackupsPauseSelf /tmp/opencode/simplebackups-pause-self.sock
     fail "PAUSE SELFTEST inconclusive: the pause scene returned without its assertion"
+fi
+if [ "${SELFTEST:-0}" = "ticks" ]; then
+    echo "== scenario J selftest: invert the restored tick counter =="
+    run_schedule_scenario SimpleBackupsTicksSelf "${E2E_TMP:-/tmp/opencode}/simplebackups-ticks-self.sock"
+    fail "TICKS SELFTEST inconclusive: the schedule scene returned without its assertion"
+fi
+if [ "${ONLY:-}" = "J" ]; then
+    echo "== scenario J alone (diagnostic) =="
+    run_schedule_scenario SimpleBackupsScheduleDiag "${E2E_TMP:-/tmp/opencode}/simplebackups-j-diag.sock"
+    echo "PASS: scenario J alone"
+    exit 0
 fi
 if [ "${STALE_SELFTEST:-0}" = 1 ]; then
     echo "== scenario F selftest: assert retention did NOT skip after a stale copy =="
@@ -802,6 +990,10 @@ echo "== scenario H2: the cap never deletes the archive just written =="
 run_same_second_scenario SimpleBackupsSameSecondCap /tmp/opencode/simplebackups-l.sock 3 "1 B"
 echo "== scenario I: pause suppresses the schedule, manual still runs, unpause resumes =="
 run_pause_scenario SimpleBackupsPause /tmp/opencode/simplebackups-m.sock
+echo "== scenario J: the persisted schedule counter survives quit and relaunch =="
+run_schedule_scenario SimpleBackupsSchedule "${E2E_TMP:-/tmp/opencode}/simplebackups-schedule.sock"
+echo "== scenario J2: a fresh world waits the full interval =="
+run_fresh_schedule_scenario SimpleBackupsFresh "${E2E_TMP:-/tmp/opencode}/simplebackups-fresh.sock"
 # The control is opt-in (CONTROL=1 with CONTROL_GAME): the campaign's control leg is the same
 # e2e run with `GAME=$CONTROL_GAME`, and launching a second game here raced the first one's
 # socket and scratch.
@@ -809,4 +1001,4 @@ if [ "${CONTROL:-0}" = 1 ]; then
     echo "== control: the unmodded game creates no backup =="
     run_control_scenario SimpleBackupsControl /tmp/opencode/simplebackups-e.sock
 fi
-echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); a manual export with the world's own shape survives until an operator adopts it and is pruned after (scenario G); a backup allocated in a second that already has generations becomes the highest suffix and survives keep and the cap (scenario H, H2); pause suppresses only the schedule and persists beside the world, a manual backup still works while paused, and unpause resumes with exactly one new zip named by list (scenario I); an archive carries its own manifest identity"
+echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); a manual export with the world's own shape survives until an operator adopts it and is pruned after (scenario G); a backup allocated in a second that already has generations becomes the highest suffix and survives keep and the cap (scenario H, H2); pause suppresses only the schedule and persists beside the world, a manual backup still works while paused, and unpause resumes with exactly one new zip named by list (scenario I); the tick counter resumes from the persisted state beside the world across quit and relaunch, while a fresh world with no state file waits the full interval (scenarios J, J2)"

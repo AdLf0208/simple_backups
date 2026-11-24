@@ -4,36 +4,37 @@
 > pre-SDK bundle (`compatibility.json`, `tools/horizon.py`, the mixin plan), which no longer loads on
 > launcher ≥ 0.2.70.
 
-## Current: SDK package 0.2.5 (2026-11-24, pin `0a875da`)
+## Current: SDK package 0.2.6 (2026-11-24, pin `0a875da`)
 
-The ladder and its logs live in [`notes.md`](notes.md) under *Slice 5 (0.2.5)* and
+The ladder and its logs live in [`notes.md`](notes.md) under *Slice 6 (0.2.6)* and
 `../_shared/evidence/simplebackups/`. Every cargo step was forwarded through
-`ports/tools/build-slot.sh run --job G10-simplebackups --port ports/simplebackups --step …` to
+`ports/tools/build-slot.sh run --job W1-simplebackups --port ports/simplebackups --step …` to
 host **AdLf-PC** (`build-slot: forwarding … to the remote runner`); `BUILD_LOCAL=1` was not set.
 The launcher build and the game legs stayed local because the second box has no `horizon-launcher`
 or Nightly versions cache (only the repaired SDK CLI and the 26.3 resources).
 
 | Check | Result | Log |
 |---|---|---|
-| `cargo test --offline` | 56 passed, 0 failed (34 `runtime`, 11 `support`, 11 `zip`) | `sdk-test.log` |
-| red run before the pause implementation | 53 passed, 3 failed (paused schedule, flag round-trip, persisted flag) | `sdk-test-red-pause.log` |
+| `cargo test --offline` | 59 passed, 0 failed (35 `runtime`, 12 `support`, 12 `zip`) | `sdk-test.log` |
+| red run before the schedule-counter implementation | 56 passed, 3 failed (restored counter, file round-trip, persisted state file) | `sdk-test-red-ticks.log` |
 | `cargo clippy --offline --all-targets -- -D warnings` | exit 0, 0 warnings | `sdk-clippy.log` |
 | `cargo fmt --check` | clean | `sdk-fmt.log` |
 | `rm -f Cargo.lock && cargo horizon-mod build` | `Built ./target/horizon-mod/simplebackups.hmod`, exit 0 | `sdk-build.log` |
-| second build + `cmp` | byte-identical, 51,968 B, sha256 `13fb3e0a…` | `sdk-sha256-second.txt` |
-| `cargo horizon-mod check` | format `native-1/0a875da…/e59da90…`, for 26.3, 51,968 bytes, exit 0 | `sdk-check.log` |
+| second build + `cmp` | byte-identical, 53,344 B, sha256 `a2261c76…` | `sdk-sha256-second.txt` |
+| `cargo horizon-mod check` | format `native-1/0a875da…/e59da90…`, for 26.3, 53,344 bytes, exit 0 | `sdk-check.log` |
 | `fits --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `0a875da  made for`, exit 0 | `sdk-fits.log` |
 | `fits --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `0b14f8a  fits`, exit 0 (the real gate) | `sdk-fits-other.log` |
 | `verify-sdk-package.py simplebackups` | 1/1, `package matches the tree` | — |
 | `unzip -l` | 10 entries, no `Cargo.lock` | `sdk-entries.log` |
-| launcher `native-build` | `Compiling simplebackups (1 of 1)`, tag `native-0a875da-15bed05fb2e0` | `../simplebackups-e2e/build-record.txt` |
-| in game | `PASS` + `EXIT:0` (scenarios A–I); control `EXIT:1`; `SELFTEST=1` `EXIT:1`; `SELFTEST=pause` `EXIT:1`; `STALE_SELFTEST=1` `EXIT:1`; the two older negatives `EXIT:1` | `../simplebackups-e2e/e2e-launcher*.log` |
-| e2e log gate | `logs=7 ok=7 missing-exit=0 bad-exit=0` (`--strict`) | — |
+| launcher `native-build` | `Compiling simplebackups (1 of 1)`, tag `native-0a875da-84cd87494e3d` | `../simplebackups-e2e/build-record.txt` |
+| in game | `PASS` + `EXIT:0` (scenarios A–J2); control `EXIT:1`; `SELFTEST=1` `EXIT:1`; `SELFTEST=pause` `EXIT:1`; `SELFTEST=ticks` `EXIT:1`; `STALE_SELFTEST=1` `EXIT:1`; the two older negatives `EXIT:1` | `../simplebackups-e2e/e2e-launcher*.log` |
+| e2e log gate | `logs=8 ok=8 missing-exit=0 bad-exit=0` (`--strict`) | — |
 
-The earlier packages were validated the same way at pin `0a875da`: 0.2.4 in *Slice 4* of
-`notes.md`, 0.2.3 in *Slice 3*, 0.2.2 in *Slice 2*; 0.2.1 was at pin `0b14f8a` (its e2e logs are
-in `../_shared/evidence/simplebackups-e2e/retired-0.2.1/`). The 0.2.4 game's provenance is saved as
-`../simplebackups-e2e/build-record-0.2.4.txt`.
+The earlier packages were validated the same way at pin `0a875da`: 0.2.5 in *Slice 5* of
+`notes.md`, 0.2.4 in *Slice 4*, 0.2.3 in *Slice 3*, 0.2.2 in *Slice 2*; 0.2.1 was at pin `0b14f8a`
+(its e2e logs are in `../_shared/evidence/simplebackups-e2e/retired-0.2.1/`). The 0.2.4/0.2.5
+games' provenance is saved as `../simplebackups-e2e/build-record-0.2.4.txt` and
+`build-record-0.2.5.txt`.
 
 ## Historical — 0.1.0 `.hnmod`
 

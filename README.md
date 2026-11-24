@@ -11,7 +11,12 @@ the game glue and `src/zip.rs` the archive writer. The launcher compiles it agai
 ## What it does
 
 - **Schedule:** `interval_ticks > 0` counts server ticks; otherwise `interval_minutes` of wall clock
-  (0 disables the schedule). Due checks run at the end of a running server tick.
+  (0 disables the schedule). Due checks run at the end of a running server tick. In tick mode the
+  progress toward the next backup is persisted in `simplebackups-schedule.txt` beside the world
+  (written on every save and on a graceful close, with a staged rename) and restored when the world
+  opens, mirroring upstream's `lastSaved` in its `BackupData` SavedData — a restart resumes the
+  interval instead of restarting it. A missing or malformed file starts a fresh interval.
+  `/simplebackups status` reports `ticks=<progress>`.
 - **Save:** the open levels are asked for a save (`LevelRef::request_save`), whose save runs at the
   start of the next tick; the copy starts when the save cycle reports back (`world_saved`).
 - **Backup:** a worker thread walks the world folder into `<world>/backups/<world>_<UTC>.zip.part`,

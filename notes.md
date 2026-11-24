@@ -22,6 +22,11 @@ panic the server tick; 53 tests, scenarios G/H/H2 in game, and the pre-fix behav
 already reads. The flag persists beside the world (upstream's `BackupData.paused`), pausing
 suppresses only the schedule, and a manual backup still works; 56 tests, scenario I green with a
 `SELFTEST=pause` inversion, and `Compiling simplebackups (1 of 1)` on the launcher build.
+**0.2.6** (2026-11-24) is the persisted-schedule slice: the tick progress toward the next backup is
+written beside the world with a staged rename on each save and on close, and restored in
+`ensure_world`, so a restart resumes the interval (upstream's `lastSaved` in `BackupData`); 59 tests,
+scenarios J/J2 green with a `SELFTEST=ticks` inversion. The regex half of the gap stays out of scope
+(R9 forbids a registry dependency).
 
 **Class + tier** (from `ports/ledger.csv`, per `horizon/docs/modpacks.md`):
 **server-only / logic**. The approach is the **logic shape**: a pure policy
@@ -220,7 +225,8 @@ phase that asserts it.
 | empty-server policy (`noPlayerBackups`) | not ported | gap; needs a player-presence API and a way to empty the server headless |
 | `latest.log` → `backup.log` | not ported | gap (needs a path outside the world folder) |
 | disk reservation before a copy | not ported | gap (upstream's `NotEnoughDiskSpaceException`) |
-| partial / chains / merge, regex ignores, persisted schedule | not ported | gaps: the pin has no game-time API for tick persistence, and a regex needs a crate |
+| persisted schedule counter (tick mode) | tested | scenario J: a zip before quit, the state file beside the world confirmed and seeded to `ticks = 10`, `ctl quit` + relaunch of the same world, `ticks=<restored ≥ 10>` parsed from the newest status line, an empty window sized from the restored value, then a fresh zip (`check_zip` CRC + manifest); `SELFTEST=ticks` (`EXIT:1`) inverts the restored value; pure rules `runtime::tests::{the_persisted_tick_counter_round_trips_through_its_file, a_restored_counter_resumes_the_interval}`, file round-trip `support::tests::the_schedule_counter_is_persisted_beside_the_world`; scenario J2 is the fresh-world differential (no state file, `ticks=0`, needs the full interval) |
+| partial / chains / merge, regex ignores | not ported | gaps: incremental/chains/merge is a larger design task; a regex needs a crate (R9 forbids a registry dependency) |
 
 ## Slice 3 (0.2.3, 2026-11-23) — review fix: retention's identity, a stale copy, same-second order
 
@@ -639,6 +645,131 @@ Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven
 > 56 tests; scenario I proves the paused window, the manual backup while paused and the resumed
 > archive, and `SELFTEST=pause` proves that assertion can fail. 51,968 B, sha256 `13fb3e0a…`.
 
+## Slice 6 (0.2.6, 2026-11-24) — the persisted schedule counter
+
+**Gap line.** The coverage table above: *"partial / chains / merge, regex ignores, persisted
+schedule | not ported | gaps: the pin has no game-time API for tick persistence, and a regex needs a
+crate"*, and *Gaps after the migration* item 4. We close **only** the persisted-schedule half;
+regex ignores stays `not ported` — R9 forbids a registry dependency, so no `regex` crate. It fits
+**server-only / logic**: one pure rule, one state file, one extra field on the existing `status`
+line; no new hook, block entity, menu, renderer or carried content. Same shape as 0.2.5's pause
+flag, which is the route this slice reuses.
+
+**Upstream rule (re-read from `ports/_shared/upstream/simplebackups/FINDINGS.md`).**
+`BackupThread.java:115-124` computes tick mode as `gameTime - lastSaved >= timer`; `lastSaved` is a
+`SavedData` (`BackupData.java:11-52`) so a restart does not reset the schedule, and
+`tryCreateBackup` updates it as soon as the worker **starts** (`:91-95`), not when it succeeds. Our
+`start_backup` already sets `last_tick` at that moment, so the persisted value is the **progress**
+`ticks.saturating_sub(last_tick)`; restoring it as `ticks = saved, last_tick = 0` makes the existing
+`due_by_ticks` fire after the remaining interval.
+
+**Port decisions.** `SCHEDULE_FILE = "simplebackups-schedule.txt"` lives beside the world (not in
+the deletable backup folder), written with a staged rename on every `world_saved` checkpoint and on
+graceful close/stop, and read in `ensure_world` when the world opens (the `SavedData` load moment).
+`runtime.rs` gains `schedule_progress`, `format_schedule_ticks` and `parse_schedule_ticks`; only an
+exact `ticks = <n>` line is accepted, so an absent or hand-edited file starts a fresh interval.
+`/simplebackups status` appends `ticks=<progress>` to the existing `saves=` line (the older
+substring assertions still match). The four 0.2.4 fixes and the 0.2.5 pause flag are untouched.
+
+**Red → green.** Three pure rules and the state-file round-trip were written as failing tests first
+(`sdk-test-red-ticks.log`):
+
+```
+---- runtime::tests::a_restored_counter_resumes_the_interval stdout ----
+thread 'runtime::tests::a_restored_counter_resumes_the_interval' (150808) panicked at src/runtime.rs:849:9:
+assertion `left == right` failed
+  left: 0
+ right: 12
+
+---- runtime::tests::the_persisted_tick_counter_round_trips_through_its_file stdout ----
+thread 'runtime::tests::the_persisted_tick_counter_round_trips_through_its_file' (150836) panicked at src/runtime.rs:839:9:
+assertion `left == right` failed: the file is one exact line
+  left: ""
+ right: "ticks = 17\n"
+
+---- support::tests::the_schedule_counter_is_persisted_beside_the_world stdout ----
+thread 'support::tests::the_schedule_counter_is_persisted_beside_the_world' (150848) panicked at src/support.rs:1207:9:
+assertion `left == right` failed: the counter must survive being re-read from disk
+  left: 0
+ right: 17
+
+test result: FAILED. 56 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+```
+
+Green: **59 passed, 0 failed** (35 `runtime`, 12 `support`, 12 `zip`) — `sdk-test.log`, clippy
+`-D warnings` 0 warnings (`sdk-clippy.log`), `fmt --check` clean (`sdk-fmt.log`).
+
+**In game.** Launcher build `native-0a875da-84cd87494e3d`, `Compiling simplebackups (1 of 1)`,
+every packed source byte-identical to this tree (`../_shared/evidence/simplebackups-e2e/build-record.txt`).
+Scenario J reuses one scratch home across `ctl quit` and relaunch; the counter is *seeded* to a known
+`ticks = 10` after the quit snapshot is confirmed, so a nonzero restored value cannot be launch drift.
+Only the newest `saves=` line is parsed (`newest_status_line` retries, so a lagging chat reply can no
+longer kill the leg with a silent `EXIT:1`):
+
+```
+fresh-world backup: …/SimpleBackupsSchedule_2026-11-24_03-50-56.zip
+zip entries: 20
+counter before quit: 11 (saves=0 retries=0 stale=false paused=false ticks=11)
+state file after quit: ticks = 17
+seeded state file: ticks = 10
+counter after relaunch: 28 (saves=0 retries=0 stale=false paused=false ticks=28)
+resumed window: no new zip across 9 ticks (ticks=28 at relaunch)
+status after the resumed window: saves=0 retries=0 stale=false paused=false ticks=43
+fresh zip after resume: …/SimpleBackupsSchedule_2026-11-24_03-51-13.zip
+== scenario J2: a fresh world waits the full interval ==
+fresh world: saves=0 retries=0 stale=false paused=false ticks=0
+fresh world: no zip across 37 ticks (ticks=0 at read)
+fresh-world differential: no state file, ticks=0 at read, one zip after the full interval
+PASS: … the tick counter resumes from the persisted state beside the world across quit and relaunch,
+      while a fresh world with no state file waits the full interval (scenarios J, J2)
+EXIT:0
+```
+
+The empty window is sized from the restored `ticks` rather than a fixed 20: the headless harness
+advances the mod's counter during ctl round-trips, so a literal 20-tick window could false-red when
+the restored value was already near the interval. The **parsed status** is the resume proof; the
+fresh-world differential backs it. `SELFTEST=ticks` inverts that parsed value and ends
+`FAIL: TICKS SELFTEST: the counter resumed (22 >= 10) — the pre-fix reset is gone, so the assertion is alive`
++ `EXIT:1`. Control `EXIT:1`, `SELFTEST=1` `EXIT:1`, `SELFTEST=pause` `EXIT:1`, `STALE_SELFTEST=1`
+`EXIT:1`, the two older negatives `EXIT:1`; `check-e2e-logs.py simplebackups-e2e --strict` →
+`logs=8 ok=8 missing-exit=0 bad-exit=0`. All seven earlier legs stayed green on the 0.2.6 game.
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices
+
+### Package 0.2.6
+
+| | |
+|---|---|
+| version | **0.2.6** (`horizon-mod.toml` + `Cargo.toml`) |
+| bytes | **53,344 B** |
+| sha256 | `a2261c76ce1f2e6df592262279df92573a9cecceb687f1624f1f44d260294c09` |
+| entries | **10** — `horizon-mod.toml`, `Cargo.toml`, `LICENSE`, `LICENSE-NOTICE.md`, `README.md`, `src/{lib,runtime,support,zip}.rs`, `uses.json`; **no `Cargo.lock`** |
+| reproducible | two builds, each after `rm -f Cargo.lock`: identical sha and `cmp` |
+| `check` | `simplebackups 0.2.6 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, 53,344 bytes, exit 0 |
+| `fits --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `0a875da  made for` (the pin tautology) |
+| `fits --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `0b14f8a  fits` — the real gate |
+| tests | **59 passed, 0 failed** (35 `runtime`, 12 `support`, 12 `zip`) |
+| `verify-sdk-package.py simplebackups` | `1/1`, `package matches the tree` |
+
+**Remote build path.** Every cargo ladder step forwarded through
+`ports/tools/build-slot.sh run --job W1-simplebackups --port ports/simplebackups --step …` to host
+**AdLf-PC** (`build-slot: forwarding … to the remote runner`); `BUILD_LOCAL=1` was never set. The
+launcher native build and all eight game legs stayed local: the second box has no
+`horizon-launcher` or Nightly versions cache (checked over ssh), so a forwarded game leg cannot
+build or launch. The launcher build ran inside a slot lease with `FORWARDED=1` (keep-local marker,
+not `BUILD_LOCAL`), producing the `Compiling simplebackups (1 of 1)` line above. All e2e scratch
+dirs came from `E2E_TMP` under `~/.cache/horizon-e2e/scratch` — never `/tmp`.
+
+### Changelog (0.2.6)
+
+> **0.2.6 — the tick schedule survives a restart.** The progress toward the next scheduled backup
+> is stored in `simplebackups-schedule.txt` beside the world with a staged rename, written on each
+> save and on a graceful close, and restored when the world opens — upstream's `lastSaved` in its
+> `BackupData` SavedData, which a restart does not reset. `/simplebackups status` reports
+> `ticks=<progress>`, so a parsed reply after relaunch proves the counter resumed. Regex ignores
+> remain out of scope (R9). 59 tests; scenario J (quit and relaunch the same world) and scenario J2
+> (a fresh world's full interval) prove it in game.
+
 ## Verification (re-pin `83ad384f`, 2026-11-06/07)
 
 
@@ -692,11 +823,13 @@ works while disabled`.
   worker can overlap an autosave and copy a region file mid-replacement (the
   upstream mod has the same race; `save_game()` flushes, which is better than
   upstream). A synchronous copy or a future save-off hook would close it.
-- The schedule is not persisted across restarts; it starts at world open.
-  Empty-server policy, `latest.log` capture, incremental/chains/merge, Cherished
-  Worlds/mc2discord and regex ignores are deferred. The disk cap (slice 2) and
-  `pause`/`unpause` (slice 5) are now ported; the pause **flag** persists, the
-  schedule counter still does not.
+- The schedule counter is now persisted across restarts (slice 6): the progress toward the next
+  backup is written beside the world and restored when it opens, so a restart resumes the interval
+  instead of starting at zero. Only tick-mode progress is stored; a wall-clock interval still starts
+  at world open (the game's own wall clock is not available through the SDK). Empty-server policy,
+  `latest.log` capture, incremental/chains/merge, Cherished Worlds/mc2discord and regex ignores stay
+  deferred. The disk cap (slice 2), `pause`/`unpause` (slice 5) and the persisted counter (slice 6)
+  are now ported.
 - Retention prunes after success (upstream deletes before creating), only archives the port can
   identify as its own (a manifest since 0.2.3; a marker-less 0.2.0–0.2.2 archive only after an
   operator's `/simplebackups adopt <file>`), and after a stale copy it prunes nothing at all; all
@@ -935,10 +1068,10 @@ remote runner. Evidence in `../_shared/evidence/simplebackups/`.
    pinned compressor crate (or ships a `deflate` helper) closes it.
 3. **The 0.1.0 harness logs are gone** (`target/horizon-test.log`, `target/G9-e2e.log` lived in
    `target/`, which the disk-hygiene rule cleans); the transcript quoted in this file is the record.
-4. Still deferred, unchanged: incremental/chains/merge, `latest.log` capture, the empty-server
-   policy, Cherished Worlds/mc2discord, regex ignores and a persisted schedule counter (**the disk
-   cap is done — *Slice 2 (0.2.2)* — and pause/unpause is done — *Slice 5 (0.2.5)*; the pause flag
-   persists but the schedule interval still restarts at world open**).
+4. Still deferred: incremental/chains/merge, `latest.log` capture, the empty-server policy,
+   Cherished Worlds/mc2discord and regex ignores (**the disk cap is done — *Slice 2 (0.2.2)* —,
+   pause/unpause — *Slice 5 (0.2.5)* —, and the persisted tick schedule — *Slice 6 (0.2.6)*; only
+   the regex half of the old combined gap remains, and R9 forbids the crate it would need**).
 5. `/simplebackups status` is the only route for a config warning; there is no log file.
 6. `side = "both"`, so the mod is installed on a client too; that is required for single player and
    a LAN host (their integrated server belongs to the client installation).

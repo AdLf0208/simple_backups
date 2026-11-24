@@ -262,6 +262,29 @@ pub fn parse_paused(text: &str) -> Option<bool> {
     }
 }
 
+/// The persisted schedule counter, stored beside the world. Upstream keeps `lastSaved` in its
+/// `BackupData` `SavedData` so a restart does not reset the interval; a native mod has no
+/// SavedData API, so the ticks elapsed since the last backup live in this file. `ensure_world`
+/// reads it when the world opens, and the save/close hooks write it back.
+pub const SCHEDULE_FILE: &str = "simplebackups-schedule.txt";
+
+/// Progress toward the next scheduled backup: ticks since the last one started. The persisted
+/// file stores this value, not the absolute tick, so a new session can resume from it.
+pub fn schedule_progress(ticks: u64, last_tick: u64) -> u64 {
+    ticks.saturating_sub(last_tick)
+}
+
+/// The one line this port writes for the persisted schedule counter.
+pub fn format_schedule_ticks(ticks: u64) -> String {
+    format!("ticks = {ticks}\n")
+}
+
+/// Read the persisted tick counter. Only an exact line this port writes counts: an absent,
+/// malformed or hand-edited file means a fresh schedule (zero ticks toward the next backup).
+pub fn parse_schedule_ticks(text: &str) -> Option<u64> {
+    text.trim().strip_prefix("ticks = ")?.parse::<u64>().ok()
+}
+
 /// Whether a copy that started at `start_seq` overlapped a save: the world's
 /// save notification counter moved while the zip was being written, so a
 /// region file may be half-replaced inside it. Such a copy is thrown away and
@@ -809,6 +832,36 @@ mod tests {
             None,
             "a malformed flag is refused"
         );
+    }
+
+    #[test]
+    fn the_persisted_tick_counter_round_trips_through_its_file() {
+        let text = format_schedule_ticks(17);
+        assert_eq!(text, "ticks = 17\n", "the file is one exact line");
+        assert_eq!(parse_schedule_ticks(&text), Some(17));
+        assert_eq!(
+            parse_schedule_ticks(""),
+            None,
+            "no file means a fresh schedule"
+        );
+        assert_eq!(
+            parse_schedule_ticks("ticks = nope\n"),
+            None,
+            "malformed is refused"
+        );
+        assert_eq!(
+            parse_schedule_ticks("paused = true\n"),
+            None,
+            "another key is refused"
+        );
+    }
+
+    #[test]
+    fn a_restored_counter_resumes_the_interval() {
+        // A saved progress of 12 at a 40-tick interval: 20 more ticks are not due, 28 are.
+        assert_eq!(schedule_progress(52, 40), 12);
+        assert!(!due_by_ticks(0, 12 + 20, 40));
+        assert!(due_by_ticks(0, 12 + 28, 40));
     }
 
     #[test]

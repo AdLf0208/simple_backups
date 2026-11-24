@@ -19,10 +19,11 @@ cleanup_games() {
     sleep 1
 }
 
-leg() { # name then VAR=val... then -- (the script gets the env via env)
+leg() { # name then VAR=val... (the script gets them via env); each leg holds its own slot lease
     local name=$1; shift
     echo "== LEG $name =="
-    ( "$@" bash "$P" ) > "$E/$name.log" 2>&1
+    ( "$@" "$CLONE/ports/tools/build-slot.sh" run --job W1-simplebackups \
+        --port ports/simplebackups --step e2e -- bash "$P" ) > "$E/$name.log" 2>&1
     local rc=$?
     echo "== LEG $name rc=$rc last=$(grep -m1 '^EXIT:' "$E/$name.log" | tail -1) =="
     cleanup_games
@@ -41,6 +42,7 @@ case "${1:-}" in
         leg e2e-launcher-pause-selftest env SELFTEST=pause GAME="$GAME" CTL="$CTL" E2E_TMP="$E2E_TMP"
         leg e2e-launcher-ticks-selftest env SELFTEST=ticks GAME="$GAME" CTL="$CTL" E2E_TMP="$E2E_TMP"
         leg e2e-launcher-chain-selftest env SELFTEST=chain GAME="$GAME" CTL="$CTL" E2E_TMP="$E2E_TMP"
+        leg e2e-launcher-adopt-digest-selftest env SELFTEST=adopt-digest GAME="$GAME" CTL="$CTL" E2E_TMP="$E2E_TMP"
         ;;
     neg)
         leg e2e-launcher-stale-selftest env STALE_SELFTEST=1 GAME="$GAME" CTL="$CTL" E2E_TMP="$E2E_TMP"

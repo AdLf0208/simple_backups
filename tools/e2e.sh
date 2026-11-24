@@ -31,7 +31,9 @@
 #   prefix, a 1999 name and the world's *own* files — is indistinguishable from a
 #   legacy archive by shape, so it survives both passes; after
 #   `/simplebackups adopt <file>` the next publish prunes it (the differential in the
-#   same folder).
+#   same folder). 0.2.11 also replaces that adopted export under the same name and size
+#   with different bytes: it must survive the next publish until re-adopted, and
+#   SELFTEST=adopt-digest inverts that survival assertion (always exits non-zero).
 # Scenario H: two backups of one second. The only free suffix is a pruned one (the base
 #   name) and a new archive that reused it would sort behind `-42` and be deleted by
 #   the pass that follows. The new archive must be allocated above the highest suffix,
@@ -819,6 +821,8 @@ with zipfile.ZipFile(path, "w") as archive:
     archive.writestr(f"{world}/data/raids.dat", "\x00\x00")
 PY
     echo "manual export: $export"
+    local original_size
+    original_size=$(stat -c %s "$export")
 
     ctl chat "/simplebackups backup"
     wait_for_other_zip "$backups" "$(basename "$export")" || fail "the first mod backup did not appear beside the manual export"
@@ -859,6 +863,58 @@ PY
         fail "an adopted archive was not pruned by the next publish"
     fi
     echo "adopted export pruned by the next publish (the differential)"
+
+    # 0.2.11: an adoption binds to the digest. Replace the adopted archive in place under the
+    # SAME name and the SAME byte length but with different bytes. It must fall out of retention
+    # and survive the next publish; only a fresh adopt makes it deletable again.
+    python3 - "$export" "$world" <<'PY'
+import sys, zipfile
+path, world = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(path, "w") as archive:
+    archive.writestr(f"{world}/level.dat", "b world")
+    archive.writestr(f"{world}/region/r.0.0.mca", "chunk")
+    archive.writestr(f"{world}/data/raids.dat", "\x00\x00")
+PY
+    local replaced_size
+    replaced_size=$(stat -c %s "$export")
+    [ "$replaced_size" = "$original_size" ] \
+        || fail "the replacement changed the size ($replaced_size != $original_size): it is not a same-name same-size replacement"
+    echo "replaced export under the same name and size ($replaced_size B): $export"
+
+    local before_list after_list i
+    before_list=$(find "$backups" -maxdepth 1 -name '*.zip' -printf '%f\n' | sort)
+    ctl chat "/simplebackups backup"
+    for i in $(seq 1 80); do
+        after_list=$(find "$backups" -maxdepth 1 -name '*.zip' -printf '%f\n' | sort)
+        [ "$after_list" != "$before_list" ] && break
+        sleep 0.25
+    done
+    [ "$after_list" != "$before_list" ] || fail "the publish after the replacement did not appear"
+    if [ -f "$export" ]; then
+        if [ "${SELFTEST:-0}" = "adopt-digest" ]; then
+            fail "ADOPT-DIGEST SELFTEST: the replaced export survived the publish — the digest assertion is alive"
+        fi
+        echo "replaced export survived the publish (digest no longer matches the adoption)"
+    else
+        if [ "${SELFTEST:-0}" = "adopt-digest" ]; then
+            fail "ADOPT-DIGEST SELFTEST inconclusive: the package deleted the replaced export (pre-fix behaviour)"
+        fi
+        fail "a replacement under the same name and size was deleted by retention"
+    fi
+
+    # Re-adopting the replacement makes it this world's again, so the next publish prunes it.
+    reply=$(adopt_text "$(basename "$export")")
+    echo "re-adopt reply: $reply"
+    grep -qi 'adopted' <<<"$reply" || fail "re-adopt did not confirm the adoption: $reply"
+    if grep -qi 'already adopted' <<<"$reply"; then
+        fail "the replacement was mistaken for the adopted original: $reply"
+    fi
+    status=$(status_text)
+    grep -q 'adopted=1' <<<"$status" || fail "status does not report one adoption after re-adopt: $status"
+    ctl chat "/simplebackups backup"
+    wait_for_removal "$export" || fail "the re-adopted replacement was not pruned by the next publish"
+    echo "re-adopted replacement pruned by the next publish (the differential)"
+
     if [ "${ADOPT_NEGATIVE:-0}" = 1 ]; then
         fail "ADOPT_NEGATIVE: the adoption scene passed on a package that should not have it"
     fi
@@ -1430,6 +1486,11 @@ if [ "${SELFTEST:-0}" = "noplayertimer" ]; then
     echo "== scenario N selftest: invert the parsed timers=<configured> assertion =="
     run_no_player_timer_scenario SimpleBackupsNoPlayerTimerSelf "${E2E_TMP:-/tmp/opencode}/simplebackups-noplayertimer-self.sock" selftest
     fail "NOPLAYERTIMER SELFTEST inconclusive: the no-player-timer scene returned without its assertion"
+fi
+if [ "${SELFTEST:-0}" = "adopt-digest" ]; then
+    echo "== scenario G selftest: invert the replaced-archive survival assertion =="
+    run_adoption_scenario SimpleBackupsAdoptDigestSelf "${E2E_TMP:-/tmp/opencode}/simplebackups-adopt-digest-self.sock"
+    fail "ADOPT-DIGEST SELFTEST inconclusive: the adoption scene returned without its assertion"
 fi
 if [ "${ONLY:-}" = "M" ]; then
     echo "== scenario M alone (diagnostic) =="

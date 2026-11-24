@@ -650,31 +650,121 @@ pub fn prune(archives: &[Archive], keep: usize, protected: &str) -> Vec<String> 
 /// `.zip`, so `/simplebackups list` and retention never mistake it for an archive.
 pub const ADOPTION_FILE: &str = "simplebackups-adopted.txt";
 
-/// One archive an operator adopted: the file name and the size it had when it was adopted.
+/// One archive an operator adopted: its name, its size and its SHA-256 at adoption time.
 ///
-/// The size is recorded so that replacing the file (a different archive under the same name)
-/// drops the adoption: retention then stops touching it again. A name alone would let anything
-/// that later lands on that path be deleted.
+/// All three are recorded so that replacing the file — even under the same name **and** size —
+/// drops the adoption: retention then stops touching it again. A name or a size alone cannot tell
+/// a replacement archive from the one the operator actually adopted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Adoption {
     pub name: String,
     pub bytes: u64,
+    pub sha256: String,
 }
 
-/// Read the adoption journal: one `<bytes>\t<name>` line per adopted archive.
+/// SHA-256 of `data` as 64 lowercase hex digits. The pin has no hash service and R9 forbids a
+/// registry crate, so the digest is computed here with `std` only.
+#[must_use]
+pub fn sha256_hex(data: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut state = [
+        0x6a09e667_u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    for block in padded.chunks_exact(64) {
+        let mut words = [0_u32; 64];
+        for (index, word) in words[..16].iter_mut().enumerate() {
+            let offset = index * 4;
+            *word = u32::from_be_bytes([
+                block[offset],
+                block[offset + 1],
+                block[offset + 2],
+                block[offset + 3],
+            ]);
+        }
+        for index in 16..64 {
+            let x = words[index - 15];
+            let y = words[index - 2];
+            let small_0 = x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3);
+            let small_1 = y.rotate_right(17) ^ y.rotate_right(19) ^ (y >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(small_0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(small_1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for (index, word) in words.iter().enumerate() {
+            let big_1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ ((!e) & g);
+            let temp_1 = h
+                .wrapping_add(big_1)
+                .wrapping_add(choose)
+                .wrapping_add(K[index])
+                .wrapping_add(*word);
+            let big_0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let temp_2 = big_0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp_1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp_1.wrapping_add(temp_2);
+        }
+        let mixed = [a, b, c, d, e, f, g, h];
+        for (slot, value) in state.iter_mut().zip(mixed) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+    state.iter().map(|word| format!("{word:08x}")).collect()
+}
+
+/// Read the adoption journal: one `<bytes>\t<sha256>\t<name>` line per adopted archive. A
+/// two-column line predates the digest bound and adopts nothing: it cannot be verified.
 #[must_use]
 pub fn parse_adoptions(text: &str) -> Vec<Adoption> {
     text.lines()
         .filter_map(|line| {
-            let (bytes, name) = line.split_once('\t')?;
+            let (bytes, rest) = line.split_once('\t')?;
+            let (digest, name) = rest.split_once('\t')?;
             let bytes = bytes.trim().parse().ok()?;
             let name = name.trim_end_matches('\r');
             if name.is_empty() || name.contains('\t') {
                 return None;
             }
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
             Some(Adoption {
                 name: name.to_owned(),
                 bytes,
+                sha256: digest.to_ascii_lowercase(),
             })
         })
         .collect()
@@ -685,16 +775,23 @@ pub fn parse_adoptions(text: &str) -> Vec<Adoption> {
 pub fn format_adoptions(adoptions: &[Adoption]) -> String {
     adoptions
         .iter()
-        .map(|adoption| format!("{}\t{}\n", adoption.bytes, adoption.name))
+        .map(|adoption| {
+            format!(
+                "{}\t{}\t{}\n",
+                adoption.bytes, adoption.sha256, adoption.name
+            )
+        })
         .collect()
 }
 
-/// Whether this exact file (name and size) is one an operator adopted.
+/// Whether this exact file (name, size **and** digest) is one an operator adopted.
 #[must_use]
-pub fn is_adopted(adoptions: &[Adoption], name: &str, bytes: u64) -> bool {
-    adoptions
-        .iter()
-        .any(|adoption| adoption.name == name && adoption.bytes == bytes)
+pub fn is_adopted(adoptions: &[Adoption], name: &str, bytes: u64, sha256: &str) -> bool {
+    adoptions.iter().any(|adoption| {
+        adoption.name == name
+            && adoption.bytes == bytes
+            && adoption.sha256.eq_ignore_ascii_case(sha256)
+    })
 }
 
 fn normalise(relative: &str) -> Option<String> {
@@ -1738,25 +1835,85 @@ mod tests {
     }
 
     #[test]
-    fn the_adoption_journal_round_trips_and_matches_the_size() {
+    fn the_adoption_journal_round_trips_the_digest() {
         let adoptions = vec![
             Adoption {
                 name: "W_2026-01-01_00-00-00.zip".to_owned(),
                 bytes: 1_234,
+                sha256: "a".repeat(64),
             },
             Adoption {
                 name: "W_2026-01-02_00-00-00.zip".to_owned(),
                 bytes: 42,
+                sha256: "b".repeat(64),
             },
         ];
-        assert_eq!(parse_adoptions(&format_adoptions(&adoptions)), adoptions);
-        assert!(is_adopted(&adoptions, "W_2026-01-01_00-00-00.zip", 1_234));
-        assert!(
-            !is_adopted(&adoptions, "W_2026-01-01_00-00-00.zip", 1_235),
-            "a file replaced since the adoption is not the adopted archive"
+        let text = format_adoptions(&adoptions);
+        assert_eq!(
+            parse_adoptions(&text),
+            adoptions,
+            "the digest must round-trip: {text}"
         );
-        assert!(!is_adopted(&adoptions, "W_2026-01-03_00-00-00.zip", 1_234));
-        assert!(parse_adoptions("garbage\n\n").is_empty());
+        let without_digest = format!("1234\t{}\nW.zip", "c".repeat(64));
+        assert!(
+            parse_adoptions(&without_digest).is_empty(),
+            "a two-column line predates the digest bound and adopts nothing"
+        );
+    }
+
+    #[test]
+    fn an_adoption_whose_digest_no_longer_matches_refuses_deletion() {
+        let adoption = Adoption {
+            name: "W_2026-01-01_00-00-00.zip".to_owned(),
+            bytes: 456,
+            sha256: "a".repeat(64),
+        };
+        let adoptions = [adoption];
+        assert!(
+            !is_adopted(
+                &adoptions,
+                "W_2026-01-01_00-00-00.zip",
+                456,
+                &"b".repeat(64)
+            ),
+            "a file replaced under the same name and size must fall out of retention"
+        );
+    }
+
+    #[test]
+    fn a_matching_digest_still_permits_deletion() {
+        let digest = "a".repeat(64);
+        let adoptions = [Adoption {
+            name: "W_2026-01-01_00-00-00.zip".to_owned(),
+            bytes: 456,
+            sha256: digest.clone(),
+        }];
+        assert!(is_adopted(
+            &adoptions,
+            "W_2026-01-01_00-00-00.zip",
+            456,
+            &digest
+        ));
+        assert!(
+            !is_adopted(&adoptions, "W_2026-01-02_00-00-00.zip", 456, &digest),
+            "the name still has to match"
+        );
+        assert!(
+            !is_adopted(&adoptions, "W_2026-01-01_00-00-00.zip", 457, &digest),
+            "the size still has to match"
+        );
+    }
+
+    #[test]
+    fn the_digest_matches_the_standard_sha256_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

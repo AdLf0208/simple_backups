@@ -1,6 +1,6 @@
 id = "simplebackups"
 name = "Simple Backups"
-version = "0.2.10"
+version = "0.2.11"
 description = """Scheduled, on-disk backups of the whole world, with retention. A backup saves the open
 world, then a worker thread walks the world folder into a .zip.part, publishes it as a .zip and
 prunes the oldest ones down to keep. A copy a save cycle overlapped is thrown away and redone. The

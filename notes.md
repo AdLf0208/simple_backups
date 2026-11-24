@@ -39,7 +39,9 @@ and all 14 e2e logs green under `--strict`.
 `noPlayerBackupTimer`, default 0 → reuse the main interval): one config key, one pure
 `empty_period_interval` rule, one branch in the existing wall-clock due gate and a `timers=` field
 on the existing `saves=` status line; 80 tests, scenario N with `SELFTEST=noplayertimer`, and all
-15 e2e logs green under `--strict`.
+15 e2e logs green under `--strict`. **0.2.11** (2026-11-24) binds an adoption to the archive's
+SHA-256 and re-checks that digest immediately before retention deletes a file, so a replacement
+under the same name and size needs re-adoption; 84 tests and a 16th e2e leg with its own inversion.
 
 **Class + tier** (from `ports/ledger.csv`, per `horizon/docs/modpacks.md`):
 **server-only / logic**. The approach is the **logic shape**: a pure policy
@@ -229,6 +231,7 @@ phase that asserts it.
 | disk cap (`max_disk_size`) | tested | scenario D: `1 B` leaves the newer archive and `over=true`; `1 TB` counterfactual leaves both and `over=false`; scenario F: the cap deletes nothing after a stale copy; scenario H2: the cap removes the older same-second generations and never the archive just written |
 | archive identity (own manifest) | tested | `support::tests::an_archive_identifies_itself_not_by_its_name`; every `check_zip` call parses `simplebackups.json` and asserts `format` + `world` |
 | legacy archive adoption (`/simplebackups adopt`) | tested | scenario G: a hand-made export with the world's own shape survives both passes, `adopt` answers `adopted`, `status` reports `adopted=1`, and the next publish prunes it; `support::tests::an_adopted_legacy_zip_becomes_deletable`; the 0.2.3 package deletes the export without any adoption (`e2e-launcher-adopt-negative.log`, `EXIT:1`) |
+| adoption digest binding (0.2.11) | tested | scenario G's replacement: the adopted export is rewritten under the same name **and size** with different bytes, survives the next publish, then is re-adopted and pruned by the one after; `SELFTEST=adopt-digest` inverts the survival assertion (`EXIT:1`). Pure: `runtime::tests::{the_adoption_journal_round_trips_the_digest,an_adoption_whose_digest_no_longer_matches_refuses_deletion,a_matching_digest_still_permits_deletion,the_digest_matches_the_standard_sha256_vectors}`; glue: `support::tests::a_replaced_adopted_archive_survives_until_it_is_re_adopted` |
 | stale copy skips retention | tested | scenario F: `stale=true` with `keep=1` and a `1 B` cap leaves both archives and `over=true`; `STALE_SELFTEST=1` asserts the pre-fix defect and exits 1 |
 | same-second generations | tested | `runtime::tests::{same_second_backups_sort_by_generation_not_as_text,the_cap_also_orders_same_second_generations_numerically,a_pruned_suffix_is_never_reused_for_a_new_backup}`; scenario H: a backup in a second that already has `-41`/`-42` becomes `-43` and both `-42`/`-43` survive `keep=2`; H2: the cap keeps only `-43`. The 0.2.3 package writes the base name and deletes it in the same pass (`e2e-launcher-same-second-negative.log`, `EXIT:1`) |
 | malformed archive name | tested | `runtime::tests::a_name_with_a_multibyte_character_at_the_stamp_boundary_is_refused`: a two-byte character at byte 19 is refused, not sliced (the pre-fix `split_at(19)` panicked) |
@@ -1847,11 +1850,149 @@ Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven
 > assertion can fail, and both interval branches are proved red-first by unit tests because a `ctl`
 > launch always has its owner online. 66,949 B, sha256 `ab6e2312…b737`.
 
+## Slice 13 (0.2.11, 2026-11-24) — bind an adoption to the archive digest
+
+**Source — the human reviewer's exact follow-up on PR #1578 (2026-11-24):** *"The later finding is
+about a replacement for an already adopted archive. At `bcb8c188dc7a`, the listing still includes
+the same 0.2.4 and 0.2.5 digests. Both match old adoptions by filename and size, which cannot tell
+a replacement archive from the one the operator adopted. Please omit those unpublished artifacts
+and bind adoption to the archive digest, rechecking it before deletion in their replacement."*
+The listing half is the orchestrator's; this slice is the product half. Class **server-only**, tier
+**logic** (ledger authority): one pure rule, one extra journal column, two guarded deletion sites
+and one extra in-game assertion — no new hook, block entity, menu, renderer, carried content or
+registry dependency (R9 still forbids a hash crate, so SHA-256 is implemented with `std` here).
+
+**Gap line.** *Gaps / deviations*: "retention prunes … a marker-less 0.2.0–0.2.2 archive only after
+an operator's `/simplebackups adopt <file>`" — an adoption identified by name and size alone cannot
+distinguish the file the operator approved from a replacement of the same length. This is a review
+fix of the same class as slices 3 and 4, not a new family.
+
+**Code paths as read (before any edit).**
+- `src/runtime.rs`: `Adoption { name, bytes }`, `parse_adoptions` (`<bytes>\t<name>`),
+  `format_adoptions`, `is_adopted(adoptions, name, bytes)` — name and size only.
+- `src/support.rs`: `adopt_archive` records `<bytes>\t<name>` in `simplebackups-adopted.txt`;
+  `retainable` = "our marker, or an adopted name+size and a world-shaped ZIP"; `owned_archives`
+  plans candidates from that; `publish` and `enforce_cap` delete them with an unguarded
+  `fs::remove_file`.
+
+**Rules (pure, `src/runtime.rs`).** `Adoption` gains `sha256: String`; the journal is now
+`<bytes>\t<sha256>\t<name>`, and `is_adopted(adoptions, name, bytes, sha256)` requires all three to
+match. `sha256_hex` is a std-only SHA-256 (verified against the `""` and `"abc"` standard vectors).
+A two-column pre-digest journal line is ignored — an old adoption cannot be verified, so it adopts
+nothing until the operator re-adopts. The digest is case-insensitive on read and normalised to
+lowercase hex.
+
+**Glue (`src/support.rs`).** `adopt_archive` digests the exact file it adopts and records that
+digest (the reply names it). `retainable` recomputes the current file's digest before calling
+`is_adopted`, so a replacement of the same name and size is no longer a retention candidate.
+`adoption_still_matches` re-checks the digest **immediately before each `remove_file`** in both
+`publish`'s `keep` pass and `enforce_cap`'s cap pass — a replacement landing between planning and
+deletion is also refused. Marked archives keep their own identity and are unaffected. The status
+line's `adopted=<n>` counts journal entries as before.
+
+**Red → green.** Three pure tests were written before the glue, against stubs that dropped the
+digest from the journal and ignored it in `is_adopted`; verbatim (`sdk-test-red-adopt-digest.log`):
+
+```
+---- runtime::tests::an_adoption_whose_digest_no_longer_matches_refuses_deletion stdout ----
+
+thread 'runtime::tests::an_adoption_whose_digest_no_longer_matches_refuses_deletion' (1446388) panicked at src/runtime.rs:1854:9:
+a file replaced under the same name and size must fall out of retention
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- runtime::tests::the_adoption_journal_round_trips_the_digest stdout ----
+
+thread 'runtime::tests::the_adoption_journal_round_trips_the_digest' (1446415) panicked at src/runtime.rs:1838:9:
+assertion `left == right` failed: the digest must round-trip: 1234	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa	W_2026-01-01_00-00-00.zip
+42	bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb	W_2026-01-02_00-00-00.zip
+
+  left: [Adoption { name: "W_2026-01-01_00-00-00.zip", bytes: 1234, sha256: "" }, Adoption { name: "W_2026-01-02_00-00-00.zip", bytes: 42, sha256: "" }]
+ right: [Adoption { name: "W_2026-01-01_00-00-00.zip", bytes: 1234, sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, Adoption { name: "W_2026-01-02_00-00-00.zip", bytes: 42, sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }]
+
+
+failures:
+    runtime::tests::an_adoption_whose_digest_no_longer_matches_refuses_deletion
+    runtime::tests::the_adoption_journal_round_trips_the_digest
+
+test result: FAILED. 81 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+```
+
+The third test, `a_matching_digest_still_permits_deletion`, is the paired guard: it passes under
+the stub (a correct digest already matched then) and must stay green — the two failures above are
+the ones the fix closes. The glue has its own red-green too: `support::tests::a_replaced_adopted_archive_survives_until_it_is_re_adopted`
+exercises adopt → replace in place with same size/different bytes → survive → re-adopt → prune.
+
+Green: **84 passed, 0 failed** (45 `runtime`, 14 `support`, 12 `zip` + the SHA-256 vectors) —
+`sdk-test.log`; clippy `--all-targets -D warnings` 0 warnings (`sdk-clippy.log`, after fixing one
+`needless_borrow` the new `owned_archives` argument introduced); `fmt --check` clean (`sdk-fmt.log`).
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development,
+systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review
+
+**In game (launcher build `native-0a875da-4dc9d8895670`, `Compiling simplebackups (1 of 1)`;
+every packed source byte-identical to this tree — `../_shared/evidence/simplebackups-e2e/build-record.txt`).**
+Scenario G's new leg, from `e2e-launcher.log` (the digests are the actual ones the mod recorded):
+
+```
+manual export survived both passes: …/SimpleBackupsAdopt_1999-01-01_00-00-00.zip
+adopt reply: adopted SimpleBackupsAdopt_1999-01-01_00-00-00.zip (456 B), digest c2742d745b31cce085fed5b2ee70b2a4c9dc11728bc02b840e03407ef0862e92; retention may now delete it
+adopted export pruned by the next publish (the differential)
+replaced export under the same name and size (456 B): …/SimpleBackupsAdopt_1999-01-01_00-00-00.zip
+replaced export survived the publish (digest no longer matches the adoption)
+re-adopt reply: adopted SimpleBackupsAdopt_1999-01-01_00-00-00.zip (456 B), digest 21acf078e852f824d2497e281ca8cd8cc8aa038a0aa2d6210fc4f3dc25449beb; retention may now delete it
+re-adopted replacement pruned by the next publish (the differential)
+```
+
+The survival assertion is fail-capable: `SELFTEST=adopt-digest` (`e2e-launcher-adopt-digest-selftest.log`)
+inverts it and ends `FAIL: ADOPT-DIGEST SELFTEST: the replaced export survived the publish — the
+digest assertion is alive` + `EXIT:1`. All 15 earlier legs stayed green on the 0.2.11 game:
+`PASS` + `EXIT:0` (A–N incl. M-off, L/L2), control `EXIT:1`, `SELFTEST=1`, `SELFTEST=pause`,
+`SELFTEST=ticks`, `SELFTEST=chain`, `SELFTEST=noplayer`, `SELFTEST=latestlog`,
+`SELFTEST=noplayertimer`, `SELFTEST=adopt-digest`, `STALE_SELFTEST=1`, `ADOPT_NEGATIVE=1`,
+`SAME_SECOND_NEGATIVE=1` all `EXIT:1`. `check-e2e-logs.py simplebackups-e2e --strict` →
+`logs=16 ok=16 missing-exit=0 bad-exit=0` (the first main-leg run hit the documented scenario-J
+busy-box flake — `ticks=0` after relaunch — and a clean re-run passed every scenario).
+
+### Package 0.2.11
+
+| | |
+|---|---|
+| version | **0.2.11** (`horizon-mod.toml` + `Cargo.toml`) |
+| bytes | **70,343 B** |
+| sha256 | `47ab00b7aa1ee0dd7966fb825a1c1c8016c4d9b2dfd65b4f9ae70a1471da3914` |
+| entries | **10** — `horizon-mod.toml`, `Cargo.toml`, `LICENSE`, `LICENSE-NOTICE.md`, `README.md`, `src/{lib,runtime,support,zip}.rs`, `uses.json`; **no `Cargo.lock`** |
+| reproducible | two builds, each after `rm -f Cargo.lock`: identical sha and `cmp` (`sdk-cmp.log`) |
+| `check` | `simplebackups 0.2.11 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, 70,343 B, exit 0 (`sdk-check.log`) |
+| `fits --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `0a875da  made for` (`sdk-fits.log`) |
+| `fits --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `0b14f8a  fits` — the real gate (`sdk-fits-other.log`) |
+| tests | **84 passed, 0 failed** (45 `runtime`, 14 `support`, 12 `zip`) |
+| `verify-sdk-package.py simplebackups` | `1/1`, `package matches the tree`, R9 clean (`sdk-verify-package.log`) |
+
+**Remote build path.** Every cargo ladder step forwarded through
+`ports/tools/build-slot.sh run --job W1-simplebackups --port ports/simplebackups --step …` to host
+**AdLf-PC** (`build-slot: forwarding … to the remote runner`); `BUILD_LOCAL=1` was never set. The
+launcher native build and every game leg stayed local (`FORWARDED=1`), because the second box has no
+`horizon-launcher` or Nightly versions cache. All e2e scratch dirs came from `E2E_TMP` under
+`~/.cache/horizon-e2e/scratch` — never `/tmp`.
+
+### Changelog (0.2.11)
+
+> **0.2.11 — an adoption binds to the archive digest, re-checked before deletion.** Review
+> follow-up on PR #1578: filename and size cannot tell a replacement archive from the one an
+> operator adopted, so `/simplebackups adopt <file>` now records the SHA-256 beside the name and
+> size (`simplebackups-adopted.txt` gains a third column), retention stops treating a replaced file
+> as adopted, and both deletion passes re-check the digest immediately before `remove_file`. An
+> older two-column journal adopts nothing until re-adopted — a safe default, never a silent
+> authorization. 84 tests, including the standard SHA-256 vectors and a support-level
+> adopt→replace→survive→re-adopt→prune cycle. Scenario G's new leg proves it in game and
+> `SELFTEST=adopt-digest` inverts the survival assertion.
+
 ## Next slice
 
 No implementable family remains in this port's gap list at pin `0a875da`. The three survivors are
 all measured blocks or out-of-scope: **disk reservation** — `blocked(no-disk-space-api)`, std and
-the pinned `horizon-mod-api` have no volume-space query and R9 forbids a `statvfs` crate (gate log
+the pinned `horizon-mod-api` have no volume-space query (a std-only `statvfs` would be a large new
+subsystem, deliberately not attempted for a review fix; gate log
 `../_shared/evidence/simplebackups/reserve-gate-0a875da.log`); **sync-copy** —
 `blocked(no-sync-observable)`, the `ctl chat` reply returns in 44 ms before any copy starts, so the
 two thread placements cannot be distinguished in one round trip (gate log

@@ -31,8 +31,11 @@ the game glue and `src/zip.rs` the archive writer. The launcher compiles it agai
   `simplebackups.json` entry names this port and this world. An archive written before that marker
   existed (0.2.0–0.2.2) has no identity until an operator runs `/simplebackups adopt <file>`: the
   `<world>/…` + `<world>/level.dat` shape is exactly what a hand-made export looks like, so the
-  shape alone is never enough. A ZIP that merely matches the `<world>_*.zip` name prefix is never
-  deleted. Foreign files and `.part` files are untouched.
+  shape alone is never enough. An adoption records the archive's **name, size and SHA-256**; a
+  file replaced under the same name — even at the same size — no longer matches the adoption and
+  survives retention until it is adopted again. The digest is re-checked immediately before each
+  deletion, not just when retention plans its removals. A ZIP that merely matches the
+  `<world>_*.zip` name prefix is never deleted. Foreign files and `.part` files are untouched.
 - **Disk cap:** after the same publish, the backup folder is measured and this world's oldest
   **identified** archives are deleted until it is at most `max_disk_size` (default `"25 GB"`, binary
   units, upstream's `maxDiskSize`). `/simplebackups status` reports
@@ -61,9 +64,9 @@ the game glue and `src/zip.rs` the archive writer. The launcher compiles it agai
   `/simplebackups list`, `/simplebackups adopt <file>`, `/simplebackups merge`, and the pause pair
   `/simplebackups pause` / `/simplebackups unpause` (also accepted as
   `/simplebackups backup pause|unpause`, upstream's spelling). A manual backup ignores both
-  `enabled` and `paused`. `adopt` records a marker-less archive (by name and size, in
+  `enabled` and `paused`. `adopt` records a marker-less archive (by name, size and SHA-256, in
   `simplebackups-adopted.txt` in the backup folder) as this world's, which is the only way it
-  becomes deletable.
+  becomes deletable; a replacement under the same name and size needs a fresh `adopt`.
 - **Pause:** `pause` suppresses only the schedule, exactly like upstream's `shouldRunBackup`
   checking `BackupData.isPaused()`; a manual `backup` still runs. The flag is persisted in
   `simplebackups-paused.txt` beside the world and reloaded when the world opens, mirroring

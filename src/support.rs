@@ -36,7 +36,7 @@ use crate::runtime::{
     format_schedule_ticks, format_size, format_size_setting, full_timer_due, game_log_path,
     is_adopted, manifest_identifies, merge_order, parse, parse_adoptions, parse_archive,
     parse_chain, parse_no_player_count, parse_paused, parse_schedule_ticks, prune,
-    schedule_progress, scheduled_backup_permitted, should_skip, to_toml,
+    schedule_progress, scheduled_backup_permitted, sha256_hex, should_skip, to_toml,
 };
 use crate::zip::{ZipWriter, entry_names, read_entry, read_entry_all};
 
@@ -839,12 +839,21 @@ fn publish(core: &mut Core, copy: &Copy, stale: bool) -> Result<Report, String> 
         let disk_bytes = folder_bytes(&backups);
         (Vec::new(), Vec::new(), disk_bytes, disk_bytes > cap, true)
     } else {
-        let archives = owned_archives(&backups, &world_name);
+        let adoptions = read_adoptions(&backups);
+        let archives = owned_archives(&backups, &world_name, &adoptions);
         // The archive this call just wrote is never a removal candidate in either pass — it is
         // the backup this run promised, and an allocation or clock race must not delete it.
-        let deleted = prune(&archives, core.cfg.keep, &name);
-        for name in &deleted {
-            let _ = fs::remove_file(backups.join(name));
+        let planned = prune(&archives, core.cfg.keep, &name);
+        // Re-check each adoption at the point of deletion: a file replaced since it was adopted
+        // is not the archive the operator approved, even if its name and size are unchanged.
+        let mut deleted = Vec::new();
+        for name in &planned {
+            if !adoption_still_matches(&backups.join(name), name, &world_name, &adoptions) {
+                continue;
+            }
+            if fs::remove_file(backups.join(name)).is_ok() {
+                deleted.push(name.clone());
+            }
         }
         // Upstream enforces `maxDiskSize` after a good backup (`BackupThread.java:154-178`): the
         // oldest archives go while the folder is over the cap, and the newest one always stays.
@@ -903,7 +912,34 @@ fn retainable(path: &Path, name: &str, bytes: u64, world: &str, adoptions: &[Ado
     if archive_is_ours(path, world) {
         return true;
     }
-    is_adopted(adoptions, name, bytes) && legacy_world_zip(path, world)
+    // The digest is the binding, not just the name and the size: a replacement archive of the
+    // same length is a different file and the operator has to adopt it again.
+    legacy_world_zip(path, world)
+        && file_sha256(path).is_some_and(|digest| is_adopted(adoptions, name, bytes, &digest))
+}
+
+/// SHA-256 of the file on disk, or None when it cannot be read. Only used for marker-less
+/// archives and for the last-moment check before a deletion.
+fn file_sha256(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(sha256_hex(&bytes))
+}
+
+/// Re-check the adoption **immediately before** `remove_file`. An archive replaced on disk since
+/// the operator adopted it — even under the same name and the same size — is no longer the adopted
+/// archive, so the deletion is refused. Marked archives carry their own identity and are not
+/// affected; a missing, unreadable or substituted file is never deleted on an adoption's word.
+fn adoption_still_matches(path: &Path, name: &str, world: &str, adoptions: &[Adoption]) -> bool {
+    if archive_is_ours(path, world) {
+        return true;
+    }
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    file_sha256(path).is_some_and(|digest| is_adopted(adoptions, name, meta.len(), &digest))
 }
 
 fn legacy_world_zip(path: &Path, world: &str) -> bool {
@@ -1048,7 +1084,8 @@ fn persist_chain(core: &Core) {
 ///
 /// The operator's word is the only identity a marker-less archive can have, so nothing here is
 /// automatic: the name has to parse as this world's archive, the file has to be a world-shaped
-/// ZIP, and the recorded size makes the adoption apply to this exact file only.
+/// ZIP, and the recorded size **and SHA-256** make the adoption apply to this exact file only —
+/// a replacement under the same name and size is a different archive and must be re-adopted.
 fn adopt_archive(dir: &Path, world: &str, requested: &str) -> Result<String, String> {
     let name = requested.trim();
     if name.is_empty()
@@ -1081,32 +1118,34 @@ fn adopt_archive(dir: &Path, world: &str, requested: &str) -> Result<String, Str
             "{name} is not a {world} ZIP (it needs a {world}/level.dat)"
         ));
     }
+    let digest = file_sha256(&path)
+        .ok_or_else(|| format!("could not read {name} to digest the adoption"))?;
     let mut adoptions = read_adoptions(dir);
-    if is_adopted(&adoptions, name, bytes) {
+    if is_adopted(&adoptions, name, bytes, &digest) {
         return Ok(format!("{name} is already adopted"));
     }
     adoptions.retain(|adoption| adoption.name != name);
     adoptions.push(Adoption {
         name: name.to_owned(),
         bytes,
+        sha256: digest.clone(),
     });
     adoptions.sort_by(|left, right| left.name.cmp(&right.name));
     write_adoptions(dir, &adoptions).map_err(|error| format!("adoption journal: {error}"))?;
     Ok(format!(
-        "adopted {name} ({}); retention may now delete it",
+        "adopted {name} ({}), digest {digest}; retention may now delete it",
         format_size(bytes)
     ))
 }
 
 /// The archives in `dir` retention may name: the port's marked archives and the legacy ones an
 /// operator adopted.
-fn owned_archives(dir: &Path, world: &str) -> Vec<Archive> {
-    let adoptions = read_adoptions(dir);
+fn owned_archives(dir: &Path, world: &str, adoptions: &[Adoption]) -> Vec<Archive> {
     folder_files(dir)
         .into_iter()
         .filter(|(name, _)| name.ends_with(".zip"))
         .filter_map(|(name, bytes)| {
-            if !retainable(&dir.join(&name), &name, bytes, world, &adoptions) {
+            if !retainable(&dir.join(&name), &name, bytes, world, adoptions) {
                 return None;
             }
             parse_archive(&name, world, bytes)
@@ -1141,10 +1180,14 @@ fn folder_bytes(dir: &Path) -> u64 {
 /// left, and whether it is still over.
 fn enforce_cap(dir: &Path, world: &str, cap: u64, protected: &str) -> (Vec<String>, u64, bool) {
     let files = folder_files(dir);
-    let archives = owned_archives(dir, world);
+    let adoptions = read_adoptions(dir);
+    let archives = owned_archives(dir, world, &adoptions);
     let plan = cap_removals(&files, &archives, cap, protected);
     let mut removed = Vec::new();
     for name in &plan.remove {
+        if !adoption_still_matches(&dir.join(name), name, world, &adoptions) {
+            continue;
+        }
         if fs::remove_file(dir.join(name)).is_ok() {
             removed.push(name.clone());
         }
@@ -1975,6 +2018,86 @@ mod tests {
     }
 
     #[test]
+    fn a_replaced_adopted_archive_survives_until_it_is_re_adopted() {
+        let world = scratch_world("adopt-digest");
+        let backups = world.join("backups");
+        fs::create_dir_all(&backups).expect("backups folder");
+        let export_name = "World_1999-01-01_00-00-00.zip";
+        let export = backups.join(export_name);
+        let contents: [(&str, &[u8]); 2] = [
+            ("World/level.dat", b"a world"),
+            ("World/region/r.0.0.mca", b"chunk"),
+        ];
+        plain_zip(&export, &contents);
+        let adopted_bytes = fs::read(&export).expect("adopted archive");
+
+        let cfg = settings_with(1, 1);
+        let first = run_backup(
+            &world,
+            &backups.join("World_2026-01-01_00-00-00.zip"),
+            &cfg,
+            Some("backups".to_owned()),
+            &full_plan(),
+            &[],
+        )
+        .expect("the first copy");
+        publish(&mut core_with(&world, cfg.clone()), &first, false).expect("publish first");
+        let reply = adopt_archive(&backups, "World", export_name).expect("adopt the export");
+        assert!(reply.contains("adopted"), "{reply}");
+        assert!(
+            reply.contains(&sha256_hex(&adopted_bytes)),
+            "the adoption must name the digest it bound to: {reply}"
+        );
+
+        // Replace it in place: identical name, identical size, different bytes.
+        plain_zip(
+            &export,
+            &[
+                ("World/level.dat", b"b world"),
+                ("World/region/r.0.0.mca", b"chunk"),
+            ],
+        );
+        let replacement = fs::read(&export).expect("replacement archive");
+        assert_eq!(replacement.len(), adopted_bytes.len(), "same size");
+        assert_ne!(replacement, adopted_bytes, "different bytes");
+
+        let second = run_backup(
+            &world,
+            &backups.join("World_2026-01-01_00-00-01.zip"),
+            &cfg,
+            Some("backups".to_owned()),
+            &full_plan(),
+            &[],
+        )
+        .expect("the second copy");
+        publish(&mut core_with(&world, cfg.clone()), &second, false).expect("publish second");
+        assert!(
+            export.exists(),
+            "a replacement under the same name and size is not the adopted archive"
+        );
+
+        // The operator adopts the replacement; the *next* publish may prune it again.
+        let reply =
+            adopt_archive(&backups, "World", export_name).expect("re-adopt the replacement");
+        assert!(reply.contains("adopted"), "{reply}");
+        let third = run_backup(
+            &world,
+            &backups.join("World_2026-01-01_00-00-02.zip"),
+            &cfg,
+            Some("backups".to_owned()),
+            &full_plan(),
+            &[],
+        )
+        .expect("the third copy");
+        publish(&mut core_with(&world, cfg), &third, false).expect("publish third");
+        assert!(
+            !export.exists(),
+            "a re-adopted replacement becomes deletable again"
+        );
+        cleanup(&world);
+    }
+
+    #[test]
     fn an_overlapped_copy_is_redone_only_within_the_rule() {
         assert!(should_retry(true, true, 0));
         assert!(should_retry(true, true, MAX_RETRIES - 1));
@@ -2164,6 +2287,7 @@ mod tests {
         let adoptions = [Adoption {
             name: "World_2026-01-01_00-00-11.zip".to_owned(),
             bytes: legacy_bytes,
+            sha256: sha256_hex(&fs::read(&legacy).expect("legacy bytes")),
         }];
         assert!(
             retainable(

@@ -4,7 +4,39 @@
 > pre-SDK bundle (`compatibility.json`, `tools/horizon.py`, the mixin plan), which no longer loads on
 > launcher ≥ 0.2.70.
 
-## Current: SDK package 0.2.10 (2026-11-24, pin `0a875da`)
+## Current: SDK package 0.2.11 (2026-11-24, pin `0a875da`)
+
+The ladder and its logs live in [`notes.md`](notes.md) under *Slice 13 (0.2.11)* and
+`../_shared/evidence/simplebackups/`. Every cargo step was forwarded through
+`ports/tools/build-slot.sh run --job W1-simplebackups --port ports/simplebackups --step …` to
+host **AdLf-PC** (`build-slot: forwarding … to the remote runner`); `BUILD_LOCAL=1` was not set.
+The launcher build and the game legs stayed local (`FORWARDED=1`) because the second box has no
+`horizon-launcher` or Nightly versions cache.
+
+| Check | Result | Log |
+|---|---|---|
+| red run before the digest bound | 81 passed, 2 failed — `an_adoption_whose_digest_no_longer_matches_refuses_deletion`, `the_adoption_journal_round_trips_the_digest` (the paired guard `a_matching_digest_still_permits_deletion` stayed green) | `sdk-test-red-adopt-digest.log` |
+| `cargo test --offline` | 84 passed, 0 failed (45 `runtime`, 14 `support`, 12 `zip`) | `sdk-test.log` |
+| `cargo clippy --offline --all-targets -- -D warnings` | exit 0, 0 warnings | `sdk-clippy.log` |
+| `cargo fmt --check` | clean | `sdk-fmt.log` |
+| two builds after `rm -f Cargo.lock` | byte-identical, 70,343 B, sha256 `47ab00b7aa1ee0dd7966fb825a1c1c8016c4d9b2dfd65b4f9ae70a1471da3914` | `sdk-build{,-second}.log`, `sdk-cmp.log` |
+| `cargo horizon-mod check` | `simplebackups 0.2.11 … for 26.3`, exit 0 | `sdk-check.log` |
+| `fits --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `0a875da  made for` | `sdk-fits.log` |
+| `fits --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `0b14f8a  fits` (the real gate) | `sdk-fits-other.log` |
+| `verify-sdk-package.py simplebackups` | 1/1, `package matches the tree`, R9 clean | `sdk-verify-package.log` |
+| launcher `native-build` | `Compiling simplebackups (1 of 1)`, tag `native-0a875da-4dc9d8895670` | `../simplebackups-e2e/build-record.txt` |
+| in game | `PASS` + `EXIT:0` (A–N, L/L2, M-off); control `EXIT:1`; all ten `SELFTEST`/negative legs `EXIT:1` including the new `SELFTEST=adopt-digest` | `../simplebackups-e2e/e2e-launcher*.log` |
+| e2e log gate | `logs=16 ok=16 missing-exit=0 bad-exit=0` (`--strict`) | — |
+
+The 0.2.11 fix binds each adoption to the archive's SHA-256 as well as name and size and re-checks
+the digest immediately before both deletion passes. Scenario G proves a replacement under the same
+name and size survives the next publish and is pruned only after re-adoption; `SELFTEST=adopt-digest`
+inverts that survival assertion. The first main-leg run hit the documented scenario-J busy-box
+flake (`ticks=0` after relaunch) and passed on a clean re-run; no source changed between the two.
+
+The 0.2.10 and earlier packages were validated the same way at pin `0a875da`; their records are in
+`notes.md` and `../_shared/evidence/simplebackups-e2e/build-record-0.2.10.txt`.
+
 
 The ladder and its logs live in [`notes.md`](notes.md) under *Slice 9 (0.2.9)* and
 `../_shared/evidence/simplebackups/`. Every cargo step was forwarded through

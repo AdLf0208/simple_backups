@@ -4,9 +4,9 @@
 > pre-SDK bundle (`compatibility.json`, `tools/horizon.py`, the mixin plan), which no longer loads on
 > launcher ≥ 0.2.70.
 
-## Current: SDK package 0.2.8 (2026-11-24, pin `0a875da`)
+## Current: SDK package 0.2.9 (2026-11-24, pin `0a875da`)
 
-The ladder and its logs live in [`notes.md`](notes.md) under *Slice 8 (0.2.8)* and
+The ladder and its logs live in [`notes.md`](notes.md) under *Slice 9 (0.2.9)* and
 `../_shared/evidence/simplebackups/`. Every cargo step was forwarded through
 `ports/tools/build-slot.sh run --job W1-simplebackups --port ports/simplebackups --step …` to
 host **AdLf-PC** (`build-slot: forwarding … to the remote runner`); `BUILD_LOCAL=1` was not set.
@@ -15,31 +15,37 @@ The launcher build and the game legs stayed local (`FORWARDED=1`) because the se
 
 | Check | Result | Log |
 |---|---|---|
-| `cargo test --offline` | 73 passed, 0 failed (43 `runtime`, 13 `support`, 12 `zip`) | `sdk-test.log` |
-| red run before the empty-server implementation | 68 passed, 5 failed (presence gate, count cap, config keys, file round-trip) | `sdk-test-red-noplayer.log` |
+| `cargo test --offline` | 77 passed, 0 failed (46 `runtime`, 14 `support`, 12 `zip`) | `sdk-test.log` |
+| red run before the log-capture implementation | 73 passed, 4 failed (entry name, path rule, config key, guarded read) | `sdk-test-red-latestlog.log` |
 | `cargo clippy --offline --all-targets -- -D warnings` | exit 0, 0 warnings | `sdk-clippy.log` |
 | `cargo fmt --check` | clean | `sdk-fmt.log` |
 | `rm -f Cargo.lock && cargo horizon-mod build` | `Built ./target/horizon-mod/simplebackups.hmod`, exit 0 | `sdk-build.log` |
-| second build + `cmp` | byte-identical, 63,311 B, sha256 `843d9fd8…` | `sdk-sha256-second.txt` |
-| `cargo horizon-mod check` | format `native-1/0a875da…/e59da90…`, for 26.3, 63,311 bytes, exit 0 | `sdk-check.log` |
+| second build + `cmp` | byte-identical, 65,996 B, sha256 `53a767bb…` | `sdk-cmp.log` |
+| `cargo horizon-mod check` | format `native-1/0a875da…/e59da90…`, for 26.3, 65,996 bytes, exit 0 | `sdk-check.log` |
 | `fits --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `0a875da  made for`, exit 0 | `sdk-fits.log` |
 | `fits --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `0b14f8a  fits`, exit 0 (the real gate) | `sdk-fits-other.log` |
 | `verify-sdk-package.py simplebackups` | 1/1, `package matches the tree`, R9 clean | `sdk-verify-package.log` |
 | `unzip -l` | 10 entries, no `Cargo.lock` | `sdk-entries.log` |
-| launcher `native-build` | `Compiling simplebackups (1 of 1)`, tag `native-0a875da-9f57a9d12e7e` | `../simplebackups-e2e/build-record.txt` |
-| in game | `PASS` + `EXIT:0` (scenarios A–L, L2); control `EXIT:1`; `SELFTEST=1` `EXIT:1`; `SELFTEST=pause` `EXIT:1`; `SELFTEST=ticks` `EXIT:1`; `SELFTEST=chain` `EXIT:1`; `SELFTEST=noplayer` `EXIT:1`; `STALE_SELFTEST=1` `EXIT:1`; the two older negatives `EXIT:1` | `../simplebackups-e2e/e2e-launcher*.log` |
-| e2e log gate | `logs=11 ok=11 missing-exit=0 bad-exit=0` (`--strict`) | — |
+| launcher `native-build` | `Compiling simplebackups (1 of 1)`, tag `native-0a875da-d81f6f42e8b4` | `../simplebackups-e2e/build-record.txt` |
+| in game | `PASS` + `EXIT:0` (scenarios A–M, M-off incl. L/L2); control `EXIT:1`; `SELFTEST=1` `EXIT:1`; `SELFTEST=pause` `EXIT:1`; `SELFTEST=ticks` `EXIT:1`; `SELFTEST=chain` `EXIT:1`; `SELFTEST=noplayer` `EXIT:1`; `SELFTEST=latestlog` `EXIT:1`; `STALE_SELFTEST=1` `EXIT:1`; the two older negatives `EXIT:1` | `../simplebackups-e2e/e2e-launcher*.log` |
+| e2e log gate | `logs=14 ok=14 missing-exit=0 bad-exit=0` (`--strict`) | — |
 
 The in-game playerless window was **not** producible: `status` reported `players=1` on every 0.2.8
-run (the harness owner is a placed player and `ctl disconnect` needs a remote server). The empty
-branch is proven by the five red-first unit tests above; scenarios L/L2 prove the online branch and
+and 0.2.9 run (the harness owner is a placed player and `ctl disconnect` needs a remote server). The
+empty branch is proven by the five red-first unit tests; scenarios L/L2 prove the online branch and
 record the observed count. No chat command was passed off as an empty server.
+
+The 0.2.9 log-capture path was **measured** before implementation: the headless launcher writes
+`$scratch/game/logs/latest.log` while `host.instance_dir()` is `$scratch` and `HORIZON_HOME` is
+`$scratch/game` (production sets them equal). The glue derives candidates from both, never from an
+absolute path; scenario M asserts an exact line from that file is inside `backup.log`, and the
+key-off scene asserts no such entry.
 
 The earlier packages were validated the same way at pin `0a875da`: 0.2.7 in *Slice 7* of
 `notes.md`, 0.2.6 in *Slice 6*, 0.2.5 in *Slice 5*, 0.2.4 in *Slice 4*, 0.2.3 in *Slice 3*, 0.2.2
 in *Slice 2*; 0.2.1 was at pin `0b14f8a` (its e2e logs are in
 `../_shared/evidence/simplebackups-e2e/retired-0.2.1/`). The current `build-record.txt` is the
-0.2.8 build.
+0.2.9 build.
 
 ## Historical — 0.1.0 `.hnmod`
 

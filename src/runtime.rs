@@ -8,6 +8,8 @@
 // entry names and skip rules. The glue does the save, the zip, and the
 // commands.
 
+use std::path::{Path, PathBuf};
+
 /// Upstream-compatible configuration (`config/simplebackups.toml`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -34,6 +36,9 @@ pub struct Settings {
     /// How many empty-server backups per period until a player joins (upstream
     /// `noPlayerBackupCount`; 0 disables them).
     pub no_player_backup_count: u64,
+    /// Append the game's `logs/latest.log` to every archive as `backup.log`
+    /// (upstream `captureLatestLog`, default true).
+    pub capture_latest_log: bool,
 }
 
 impl Default for Settings {
@@ -56,6 +61,8 @@ impl Default for Settings {
             full_backup_timer_minutes: DEFAULT_FULL_BACKUP_TIMER_MINUTES,
             no_player_backups: false,
             no_player_backup_count: 1,
+            // Upstream `captureLatestLog` defaults to true.
+            capture_latest_log: true,
         }
     }
 }
@@ -194,6 +201,10 @@ pub fn parse(input: &str) -> (Settings, Vec<String>) {
                 Ok(parsed) => config.no_player_backup_count = parsed,
                 Err(_) => warnings.push(format!("no_player_backup_count: not a number: {value}")),
             },
+            "capture_latest_log" => match parse_bool(value) {
+                Some(parsed) => config.capture_latest_log = parsed,
+                None => warnings.push(format!("capture_latest_log: not a boolean: {value}")),
+            },
             other => warnings.push(format!("unknown key: {other}")),
         }
     }
@@ -268,6 +279,10 @@ pub fn to_toml(config: &Settings) -> String {
     out.push_str(&format!(
         "no_player_backup_count = {}\n",
         config.no_player_backup_count
+    ));
+    out.push_str(&format!(
+        "capture_latest_log = {}\n",
+        config.capture_latest_log
     ));
     out
 }
@@ -671,6 +686,29 @@ fn normalise(relative: &str) -> Option<String> {
 pub fn entry_name(world: &str, relative: &str) -> Option<String> {
     let relative = normalise(relative)?;
     Some(format!("{world}/{relative}"))
+}
+
+/// The single flat entry the captured game log is written under (upstream's `backup.log`).
+pub const BACKUP_LOG_ENTRY: &str = "backup.log";
+
+/// The game log's path under the game's home folder (upstream's `logs/latest.log`).
+pub const GAME_LOG_RELATIVE: &str = "logs/latest.log";
+
+/// The entry-name rule for the captured log: one flat name, never a path. The log
+/// sits beside the world tree in the archive, not inside it, so a nested or
+/// parent-traversing name is refused (upstream writes a single `backup.log`).
+#[must_use]
+pub fn backup_log_entry(name: &str) -> Option<&str> {
+    (name == BACKUP_LOG_ENTRY).then_some(name)
+}
+
+/// Resolve the game log under `home` from its relative name. Only the exact
+/// `logs/latest.log` is accepted: `normalise` refuses an absolute path and any
+/// `..` component, and the equality check refuses a different file. The glue
+/// additionally refuses a symlink and any path that canonicalises out of `home`.
+#[must_use]
+pub fn game_log_path(home: &Path, relative: &str) -> Option<PathBuf> {
+    (normalise(relative)? == GAME_LOG_RELATIVE).then(|| home.join(GAME_LOG_RELATIVE))
 }
 
 /// Whether a world-relative path is left out of the zip.
@@ -1945,5 +1983,66 @@ mod tests {
         assert_eq!(round_trip, config);
         let (_, warnings) = parse("no_player_backup_count = -1\nno_player_backups = yes\n");
         assert_eq!(warnings.len(), 2, "bad values keep the defaults and warn");
+    }
+
+    #[test]
+    fn the_game_log_is_stored_under_one_flat_entry_name() {
+        assert_eq!(backup_log_entry("backup.log"), Some("backup.log"));
+        assert_eq!(
+            backup_log_entry("World/backup.log"),
+            None,
+            "the log is a flat entry beside the world tree"
+        );
+        assert_eq!(
+            backup_log_entry("../backup.log"),
+            None,
+            "a path-shaped entry name is refused"
+        );
+    }
+
+    #[test]
+    fn the_log_capture_key_defaults_on_and_round_trips() {
+        assert!(
+            Settings::default().capture_latest_log,
+            "upstream captureLatestLog defaults to true"
+        );
+        let (config, warnings) = parse("capture_latest_log = false\n");
+        assert!(warnings.is_empty(), "the key must be known: {warnings:?}");
+        assert!(
+            !config.capture_latest_log,
+            "the config must be able to disable capture"
+        );
+        let text = to_toml(&config);
+        assert!(
+            text.contains("capture_latest_log = false"),
+            "the key must be written back: {text}"
+        );
+        let (again, warnings) = parse(&text);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(again, config);
+    }
+
+    #[test]
+    fn a_game_log_path_may_not_leave_the_game_folder() {
+        let home = Path::new("/game");
+        assert_eq!(
+            game_log_path(home, GAME_LOG_RELATIVE),
+            Some(home.join("logs/latest.log"))
+        );
+        assert_eq!(
+            game_log_path(home, "../latest.log"),
+            None,
+            "parent traversal must be refused"
+        );
+        assert_eq!(
+            game_log_path(home, "/etc/passwd"),
+            None,
+            "an absolute path must be refused"
+        );
+        assert_eq!(
+            game_log_path(home, "logs/debug.log"),
+            None,
+            "only latest.log is captured"
+        );
     }
 }

@@ -21,7 +21,11 @@ the game glue and `src/zip.rs` the archive writer. The launcher compiles it agai
   start of the next tick; the copy starts when the save cycle reports back (`world_saved`).
 - **Backup:** a worker thread walks the world folder into `<world>/backups/<world>_<UTC>.zip.part`,
   publishes it by renaming, and skips `session.lock`, `.part`/`.tmp`, symlinks and the backups
-  folder. Entries are `<world>/<relative path>`.
+  folder. Entries are `<world>/<relative path>`. After the world walk, the game's
+  `logs/latest.log` is appended as one flat `backup.log` entry when `capture_latest_log = true`
+  (upstream's `captureLatestLog`, default true). The path is derived from the game's own directory
+  (`host.instance_dir()`, with the launcher's `HORIZON_HOME` as a second candidate); a symlink, an
+  absolute path and anything resolving outside that root are refused.
 - **Retention:** after a successful publish, the oldest archives this port wrote are pruned until
   `keep` remain (`keep` is at least 1). An archive counts as this port's when its own
   `simplebackups.json` entry names this port and this world. An archive written before that marker
@@ -78,7 +82,8 @@ the game glue and `src/zip.rs` the archive writer. The launcher compiles it agai
 - **Config** `config/simplebackups.toml`: `enabled`, `interval_minutes`, `interval_ticks`, `keep`,
   `max_disk_size`, `compression_level`, `save_before_backup`, `retry_on_save`, `broadcast`,
   `backups_dir`, `ignored_paths`, `ignored_files`, `backup_type`, `full_backup_timer`,
-  `no_player_backups`, `no_player_backup_count`. A missing file is written with the defaults.
+  `no_player_backups`, `no_player_backup_count`, `capture_latest_log`. A missing file is written
+  with the defaults.
 
 ## Notes on this port
 

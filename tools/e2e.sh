@@ -60,6 +60,12 @@
 # `chain=1` (the differential). `save_before_backup=false` keeps the game from rewriting other
 # world files between the two backups, so exactly one entry is changed. SELFTEST=chain inverts
 # the manifest/base assertion and exits non-zero.
+# Scenario M: the game log is appended to the archive as a flat `backup.log` entry
+# (upstream's captureLatestLog, default true). The line asserted is read from the
+# scratch `logs/latest.log` before the backup, so it is a concrete line the game
+# really wrote. `capture_latest_log = false` is the counterfactual (no entry);
+# SELFTEST=latestlog inverts the positive assertion and exits non-zero.
+#
 # Scenario L: the empty-server policy (noPlayerBackups / noPlayerBackupCount). The harness launches
 # a single-player integrated world, so `status`'s `players=<n>` field decides whether a genuinely
 # empty window is available; when the owner is online, the online branch is asserted instead and the
@@ -195,7 +201,7 @@ with zipfile.ZipFile(path) as archive:
     assert any(name.endswith("/level.dat") for name in names), names
     assert not any(name.endswith("session.lock") for name in names), names
     assert not any("/backups/" in name for name in names), names
-    assert all(name == "simplebackups.json" or name.startswith(world + "/") for name in names), names
+    assert all(name in ("simplebackups.json", "backup.log") or name.startswith(world + "/") for name in names), names
     print(f"zip entries: {len(names)}")
 PY
 }
@@ -251,7 +257,92 @@ max_disk_size = "25 GB"
 backup_type = "$type"
 full_backup_timer = 525960
 ignored_paths = ["dimensions", "region"]
+# A child must carry exactly the changed world entry; the flat log entry is
+# proved in scenario M, not here.
+capture_latest_log = false
 EOF
+}
+
+# Scenario M config: log capture on or off. Manual backups keep the scene short;
+# save_before_backup=false avoids a save cycle between the log read and the zip.
+write_log_config() { # config-dir capture
+    local dir=$1 capture=$2
+    mkdir -p "$dir"
+    cat > "$dir/simplebackups.toml" <<EOF
+enabled = false
+interval_minutes = 0
+interval_ticks = 40
+keep = 3
+compression_level = 1
+save_before_backup = false
+retry_on_save = true
+broadcast = false
+backups_dir = "backups"
+max_disk_size = "25 GB"
+capture_latest_log = $capture
+EOF
+}
+
+# Scenario M: pick a concrete line from the scratch latest.log, take a manual
+# backup, then assert the newest archive carries a flat `backup.log` entry with
+# that exact line. `off` asserts there is no such entry, `selftest` inverts the
+# positive assertion (and always exits non-zero).
+run_game_log_scenario() { # world sock mode
+    local world=$1 sock=$2 mode=${3:-on}
+    local scratch
+    scratch=$(mktemp -d "${E2E_TMP:-/tmp/opencode}/simplebackups-gamelog.XXXXXX")
+    local capture=true
+    [ "$mode" != off ] || capture=false
+    write_log_config "${CONFIG_DIR:-$scratch/config}" "$capture"
+    launch "$sock" "$scratch" "$GAME" "$world"
+    local ctl
+    ctl() { "$CTL" --socket "$sock" "$@"; }
+    ctl wait-ready 120
+    ctl wait 10
+
+    # Measured at this pin: the headless launcher writes <scratch>/game/logs/latest.log
+    # (HORIZON_HOME=<scratch>/game) while saves live in <scratch>/saves.
+    local log="$scratch/game/logs/latest.log"
+    [ -f "$log" ] || fail "the launcher wrote no $log (log-path measurement changed)"
+    local line
+    line=$(grep -F -m1 'Starting integrated minecraft server' "$log" || true)
+    [ -n "$line" ] || fail "no concrete server-start line in $log: $(head -3 "$log")"
+    echo "game log ($log) line: $line"
+
+    local backups="$scratch/saves/$world/backups"
+    ctl chat "/simplebackups backup"
+    wait_for_zip "$backups" 1 || fail "the manual backup did not appear"
+    local archive
+    archive=$(first_zip "$backups")
+    check_zip "$archive" "$world"
+    python3 - "$archive" "$line" "$mode" <<'PY'
+import sys, zipfile
+path, line, mode = sys.argv[1:]
+with zipfile.ZipFile(path) as archive:
+    names = archive.namelist()
+    has = "backup.log" in names
+    if mode == "selftest":
+        if has and line in archive.read("backup.log").decode("utf-8", "replace"):
+            raise SystemExit("FAIL: GAMELOG SELFTEST: backup.log held the chosen line — the assertion is alive")
+        raise SystemExit("FAIL: GAMELOG SELFTEST inconclusive: no backup.log with that line either")
+    if mode == "off":
+        if has:
+            raise SystemExit("FAIL: capture_latest_log=false still packed a backup.log")
+    else:
+        if not has:
+            raise SystemExit(f"FAIL: no flat backup.log entry in {names}")
+        text = archive.read("backup.log").decode("utf-8", "replace")
+        if line not in text:
+            raise SystemExit("FAIL: backup.log does not contain the exact chosen line")
+PY
+    if [ "${mode:-on}" = on ]; then
+        echo "backup.log holds the exact line chosen from the scratch latest.log"
+    elif [ "${mode:-on}" = off ]; then
+        echo "counterfactual: capture_latest_log=false packed no backup.log"
+    fi
+    ctl quit >/dev/null 2>&1 || true
+    sleep 1
+    rm -rf "$scratch"
 }
 
 # Scenario L config: the empty-server policy. The two keys are upstream's
@@ -1269,6 +1360,23 @@ if [ "${SELFTEST:-0}" = "noplayer" ]; then
     run_no_player_scenario SimpleBackupsNoPlayerSelf "${E2E_TMP:-/tmp/opencode}/simplebackups-noplayer-self.sock" selftest
     fail "NOPLAYER SELFTEST inconclusive: the no-player scene returned without its assertion"
 fi
+if [ "${SELFTEST:-0}" = "latestlog" ]; then
+    echo "== scenario M selftest: invert the backup.log assertion =="
+    run_game_log_scenario SimpleBackupsGameLogSelf "${E2E_TMP:-/tmp/opencode}/simplebackups-gamelog-self.sock" selftest
+    fail "GAMELOG SELFTEST inconclusive: the log scene returned without its assertion"
+fi
+if [ "${ONLY:-}" = "M" ]; then
+    echo "== scenario M alone (diagnostic) =="
+    run_game_log_scenario SimpleBackupsGameLogDiag "${E2E_TMP:-/tmp/opencode}/simplebackups-gamelog-diag.sock" on
+    echo "PASS: scenario M alone"
+    exit 0
+fi
+if [ "${ONLY:-}" = "Mo" ]; then
+    echo "== scenario M counterfactual alone (diagnostic): capture_latest_log=false =="
+    run_game_log_scenario SimpleBackupsGameLogOffDiag "${E2E_TMP:-/tmp/opencode}/simplebackups-gamelog-off-diag.sock" off
+    echo "PASS: scenario M counterfactual alone"
+    exit 0
+fi
 if [ "${ONLY:-}" = "L" ]; then
     echo "== scenario L alone (diagnostic): report the observed player count =="
     run_no_player_scenario SimpleBackupsNoPlayerDiag "${E2E_TMP:-/tmp/opencode}/simplebackups-noplayer-diag.sock" default
@@ -1336,6 +1444,10 @@ echo "== scenario L: empty-server policy (the assertion the harness can make) ==
 run_no_player_scenario SimpleBackupsNoPlayer "${E2E_TMP:-/tmp/opencode}/simplebackups-noplayer.sock" default
 echo "== scenario L2: the noPlayerBackups opt-in and its per-period count =="
 run_no_player_scenario SimpleBackupsNoPlayerOptIn "${E2E_TMP:-/tmp/opencode}/simplebackups-noplayer-optin.sock" optin
+echo "== scenario M: the scratch latest.log is captured as a flat backup.log =="
+run_game_log_scenario SimpleBackupsGameLog "${E2E_TMP:-/tmp/opencode}/simplebackups-gamelog.sock" on
+echo "== scenario M counterfactual: capture_latest_log=false packs no backup.log =="
+run_game_log_scenario SimpleBackupsGameLogOff "${E2E_TMP:-/tmp/opencode}/simplebackups-gamelog-off.sock" off
 # The control is opt-in (CONTROL=1 with CONTROL_GAME): the campaign's control leg is the same
 # e2e run with `GAME=$CONTROL_GAME`, and launching a second game here raced the first one's
 # socket and scratch.
@@ -1343,4 +1455,4 @@ if [ "${CONTROL:-0}" = 1 ]; then
     echo "== control: the unmodded game creates no backup =="
     run_control_scenario SimpleBackupsControl /tmp/opencode/simplebackups-e.sock
 fi
-echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); a manual export with the world's own shape survives until an operator adopts it and is pruned after (scenario G); a backup allocated in a second that already has generations becomes the highest suffix and survives keep and the cap (scenario H, H2); pause suppresses only the schedule and persists beside the world, a manual backup still works while paused, and unpause resumes with exactly one new zip named by list (scenario I); the tick counter resumes from the persisted state beside the world across quit and relaunch, while a fresh world with no state file waits the full interval (scenarios J, J2); an incremental chain's child names its full base and carries only the changed file, status reports chain=2 and list names both, merge folds the chain into one standalone archive, and a fresh world's first backup is full with chain=1 (scenario K); the empty-server policy's online branch still schedules with players online while status reports the observed player count and the persisted empty-period counter (scenarios L, L2)"
+echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); a manual export with the world's own shape survives until an operator adopts it and is pruned after (scenario G); a backup allocated in a second that already has generations becomes the highest suffix and survives keep and the cap (scenario H, H2); pause suppresses only the schedule and persists beside the world, a manual backup still works while paused, and unpause resumes with exactly one new zip named by list (scenario I); the tick counter resumes from the persisted state beside the world across quit and relaunch, while a fresh world with no state file waits the full interval (scenarios J, J2); an incremental chain's child names its full base and carries only the changed file, status reports chain=2 and list names both, merge folds the chain into one standalone archive, and a fresh world's first backup is full with chain=1 (scenario K); the empty-server policy's online branch still schedules with players online while status reports the observed player count and the persisted empty-period counter (scenarios L, L2); a concrete line from the scratch latest.log is captured as a flat backup.log entry and capture_latest_log=false packs no such entry (scenario M)"

@@ -31,6 +31,10 @@ tests, scenario K. **0.2.8** (2026-11-24) is the empty-server policy (`noPlayerB
 `noPlayerBackupCount`): a pure gate wrapping `shouldRunBackup`, one persisted counter beside the
 world and two new `status` fields; 73 tests, scenarios L/L2, with the playerless branch proven
 unit-first because a `ctl` launch always has its owner online.
+**0.2.9** (2026-11-24) captures the game's `logs/latest.log` into every archive as a flat
+`backup.log` entry (upstream `captureLatestLog`, default true): one config key, one pure entry-name
+rule and one guarded read after the world walk; 77 tests, scenarios M/M-off, `SELFTEST=latestlog`,
+and all 14 e2e logs green under `--strict`.
 
 **Class + tier** (from `ports/ledger.csv`, per `horizon/docs/modpacks.md`):
 **server-only / logic**. The approach is the **logic shape**: a pure policy
@@ -227,7 +231,7 @@ phase that asserts it.
 | save-overlap retry (`retry_on_save`) | tested | unit test `should_retry`; scenario F forces a real overlap with `ctl save` during a 256 MiB copy (`stale=true`, `saves=6`); scenario C's pause/resume still prints `SKIP` (that path cannot make a save) |
 | `pause` / `unpause` | tested | scenario I: `interval_ticks=40`, a first zip (differential), `/simplebackups pause` → 150 ticks with no new zip and `status` `paused=true` (the `saves=` line, not the whole chat buffer), the persisted flag file read back, a manual `backup` while paused → a fresh zip, `/simplebackups backup unpause` → `paused=false` and exactly one new zip named by `list`; `SELFTEST=pause` (`EXIT:1`) proves the paused-window assertion can fail. The pure rules are `runtime::tests::a_paused_schedule_never_starts_a_backup` and `the_pause_flag_round_trips_through_its_file`, the file round-trip `support::tests::the_pause_flag_is_persisted_beside_the_world` |
 | empty-server policy (`noPlayerBackups` / `noPlayerBackupCount`) | tested | scenario L: `status` reports `players=1` (the harness owner is always online), so the online branch's scheduled backup is asserted and the playerless window is recorded as not producible; scenario L2 runs the same with `no_player_backups = true`; the empty branch and the zero/count cap are proven by `runtime::tests::{an_empty_server_never_schedules_by_default,no_player_count_caps_backups_per_empty_period}`, the file round-trip by `support::tests::the_no_player_counter_is_persisted_beside_the_world` |
-| `latest.log` → `backup.log` | not ported | gap (needs a path outside the world folder) |
+| `latest.log` → `backup.log` | tested | scenario M: a concrete line is read from the scratch `<home>/logs/latest.log` before `ctl chat "/simplebackups backup"`; the newest archive's flat `backup.log` entry contains that **exact** line (`python3 zipfile`, CRC checked by `check_zip`); the `capture_latest_log = false` counterfactual packs no such entry and `SELFTEST=latestlog` inverts to `EXIT:1`. Pure rules: `backup_log_entry` (one flat name) and `game_log_path` (no absolute/`..`/other file); the glue refuses symlinks and canonical paths outside the game home. |
 | disk reservation before a copy | not ported | gap (upstream's `NotEnoughDiskSpaceException`) |
 | persisted schedule counter (tick mode) | tested | scenario J: a zip before quit, the state file beside the world confirmed and seeded to `ticks = 10`, `ctl quit` + relaunch of the same world, `ticks=<restored ≥ 10>` parsed from the newest status line, an empty window sized from the restored value, then a fresh zip (`check_zip` CRC + manifest); `SELFTEST=ticks` (`EXIT:1`) inverts the restored value; pure rules `runtime::tests::{the_persisted_tick_counter_round_trips_through_its_file, a_restored_counter_resumes_the_interval}`, file round-trip `support::tests::the_schedule_counter_is_persisted_beside_the_world`; scenario J2 is the fresh-world differential (no state file, `ticks=0`, needs the full interval) |
 | partial / chains / merge | tested | scenario K: an incremental child names its full base, carries only `World/changed-marker.txt`, `status` reports `chain=2`, `list` names both, `merge` writes a standalone archive; the fresh-world first backup is full with `chain=1`; `SELFTEST=chain` (`EXIT:1`) inverts the base assertion. Pure rules: `entry_changed`, `choose_kind`, `changed_threshold`, `full_timer_due`, `merge_order`, the chain-state and manifest round-trips. |
@@ -1126,7 +1130,7 @@ works while disabled`.
   at world open (the game's own wall clock is not available through the SDK). The empty-server
   policy is now ported (slice 8) — a `ctl` launch always has the world owner placed, so its
   playerless branch is proven by unit tests, not in game; upstream's separate `noPlayerBackupTimer`
-  stays a deviation (the empty period uses the same interval). `latest.log` capture, Cherished
+  stays a deviation (the empty period uses the same interval). `latest.log` capture is now ported (slice 9); Cherished
   Worlds/mc2discord and regex ignores stay deferred. The disk cap
   (slice 2), `pause`/`unpause` (slice 5), the persisted counter (slice 6) and incremental
   chains/merge (slice 7) are now ported. Chain children are not standalone restore points; the flat
@@ -1199,8 +1203,8 @@ works while disabled`.
   `native_config_dir()` is static and safe anywhere.
 - **Deferred (as of the 2026-11-03 analysis; pause and the disk cap were later ported — slices 5
   and 2; the persisted schedule slice 6, chains/merge slice 7, empty-server policy slice 8):**
-  `latest.log` capture, Cherished Worlds, mc2discord, regex ignores, sync-copy mode, and upstream's
-  separate `noPlayerBackupTimer`.
+  Cherished Worlds, mc2discord, regex ignores, sync-copy mode, and upstream's
+  separate `noPlayerBackupTimer`. (`latest.log` capture was later ported — slice 9.)
 - **Licence:** Apache-2.0 permits derivatives, but the port stays local-only
   until the maintainer approves publishing (ARCHITECTURE.md §8). The scaffold's
   `Cargo.toml` currently declares `MIT` while upstream is Apache-2.0; the
@@ -1371,7 +1375,7 @@ remote runner. Evidence in `../_shared/evidence/simplebackups/`.
    pinned compressor crate (or ships a `deflate` helper) closes it.
 3. **The 0.1.0 harness logs are gone** (`target/horizon-test.log`, `target/G9-e2e.log` lived in
    `target/`, which the disk-hygiene rule cleans); the transcript quoted in this file is the record.
-4. Still deferred: `latest.log` capture, Cherished Worlds/mc2discord and regex ignores (**the disk
+4. Still deferred: Cherished Worlds/mc2discord and regex ignores (**the disk
    cap is done — *Slice 2 (0.2.2)* —, pause/unpause — *Slice 5 (0.2.5)* —, the persisted tick
    schedule — *Slice 6 (0.2.6)* —, incremental chains/merge — *Slice 7 (0.2.7)* —, and the
    empty-server policy — *Slice 8 (0.2.8)*; only the regex half of the old combined gap remains,
@@ -1424,3 +1428,135 @@ Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven
 > total but are never deleted. Repinned to Horizon `0a875da` (mixins unchanged), 36 tests, and the
 > new scene is proven in game — a 1 B cap leaves exactly the newer archive, a 1 TB counterfactual
 > leaves both. Package 38,169 B, sha256 `2edec944…`.
+
+## Slice 9 (0.2.9, 2026-11-24) — capture `latest.log` as `backup.log`
+
+**Gap line.** The coverage table above: *"`latest.log` → `backup.log` | not ported | gap (needs a
+path outside the world folder)"*, and *Gaps after the migration* item 4. Upstream's
+`captureLatestLog` (`CommonConfig.java:65-66`, default true) makes `BackupThread.java:469-498`
+reopen the finished archive and append the game log as a flat `backup.log`. Class **server-only**,
+tier **logic** (ledger authority): one config key, one pure entry-name rule, one guarded glue read
+after the world walk — no new hook, crate (R9), block entity, menu or carried content.
+
+**First measurement — the log path (done before any code).** A headless launch in a fresh
+`E2E_TMP` scratch home with the exact `launcher-game.sh env simplebackups` environment printed:
+
+```
+SCRATCH=/home/adlf/.cache/horizon-e2e/scratch/simplebackups-logprobe.046XZl
+$SCRATCH/config/simplebackups.toml
+$SCRATCH/game/logs/latest.log          (1,240 B)
+$SCRATCH/game/logs/.lock
+$SCRATCH/saves/LogProbe/level.dat
+$SCRATCH/options.txt
+$SCRATCH/game/: logs/                   # no saves here
+```
+
+`HORIZON_HOME=$scratch/game`; the working/instance directory (`host.instance_dir()`, where
+`options.txt` and `saves/` live) is `$scratch`. The production launcher sets
+`cmd.current_dir(&instance.home).env("HORIZON_HOME", &instance.home)`
+(`launcher/src/instances.rs:661-663`), so there `instance_dir()/logs/latest.log` **is** the log; the
+harness sets `HORIZON_HOME` beside the instance, so the launcher's own variable is a second measured
+root. `ConfigFiles` itself is bound to the mod's `config/` and refuses `..` and anything it does
+not own (`content/config_files.rs:18-37,114-121`), so it cannot name the log; the path-bearing
+method in the same `ConfigHost` area is `instance_dir()`. No absolute path is hardcoded: the glue
+tries `instance_dir()/logs/latest.log` and `$HORIZON_HOME/logs/latest.log`, in that order.
+
+**Rules (pure, `src/runtime.rs`).** `BACKUP_LOG_ENTRY = "backup.log"`,
+`GAME_LOG_RELATIVE = "logs/latest.log"`, `backup_log_entry(name)` accepts only that exact flat name
+(a nested or `..` name is refused), and `game_log_path(home, relative)` accepts only the exact
+relative name through the existing `normalise` (absolute paths and parent components refused).
+`Settings` gains `capture_latest_log` (default true, upstream's spelling) with parse, warning and
+round-trip. Glue (`src/support.rs`): `game_log_homes` derives the two roots on the host thread;
+`read_one_game_log` refuses a symlink at the file, a symlinked parent that resolves out of the
+home, and any path not `file_type().is_file()`; the worker appends `backup.log` after the world
+walk when the key is on. A missing log is not a backup failure — it just means no entry.
+
+**Red → green.** Four failing tests first (`sdk-test-red-latestlog.log`, verbatim):
+
+```
+---- runtime::tests::a_game_log_path_may_not_leave_the_game_folder stdout ----
+thread 'runtime::tests::a_game_log_path_may_not_leave_the_game_folder' (663270) panicked at src/runtime.rs:2019:9:
+assertion `left == right` failed: parent traversal must be refused
+  left: Some("/game/logs/latest.log")
+ right: None
+
+---- runtime::tests::the_game_log_is_stored_under_one_flat_entry_name stdout ----
+thread 'runtime::tests::the_game_log_is_stored_under_one_flat_entry_name' (663312) panicked at src/runtime.rs:1978:9:
+assertion `left == right` failed: the log is a flat entry beside the world tree
+  left: Some("backup.log")
+ right: None
+
+---- runtime::tests::the_log_capture_key_defaults_on_and_round_trips stdout ----
+thread 'runtime::tests::the_log_capture_key_defaults_on_and_round_trips' (663313) panicked at src/runtime.rs:1992:9:
+upstream captureLatestLog defaults to true
+
+---- support::tests::the_game_log_is_read_from_a_safe_path_only stdout ----
+thread 'support::tests::the_game_log_is_read_from_a_safe_path_only' (663328) panicked at src/support.rs:2140:9:
+assertion `left == right` failed: the exact bytes of latest.log are captured
+  left: None
+ right: Some([91, 49, 48, 58, 52, 54, 58, 51, 52, 93, ...])
+
+test result: FAILED. 73 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+```
+
+Green: **77 passed, 0 failed** (`sdk-test.log`), clippy `-D warnings` 0 warnings (`sdk-clippy.log`),
+`fmt --check` clean (`sdk-fmt.log`). Clippy caught two real nits (a collapsible `if` and three
+`[home.clone()]` slices in tests); both were fixed, not allowed.
+
+### Package 0.2.9
+
+| | |
+|---|---|
+| version | **0.2.9** (`horizon-mod.toml` + `Cargo.toml`) |
+| bytes | **65,996 B** |
+| sha256 | `53a767bb1c2a55915391ea69630fd4f36bad5a30ec8727bac820e2ad8bb31606` |
+| entries | **10** — `horizon-mod.toml`, `Cargo.toml`, `LICENSE`, `LICENSE-NOTICE.md`, `README.md`, `src/{lib,runtime,support,zip}.rs`, `uses.json`; **no `Cargo.lock`** |
+| reproducible | two builds, each after `rm -f Cargo.lock`: `cmp` identical, same sha (`sdk-cmp.log`) |
+| `check` | `simplebackups 0.2.9 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, 65,996 bytes, exit 0 |
+| `fits --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `0a875da  made for` |
+| `fits --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `0b14f8a  fits` — the real gate |
+| `verify-sdk-package.py simplebackups` | `1/1`, `package matches the tree`, R9 clean |
+
+**In game.** Launcher build `native-0a875da-d81f6f42e8b4`, `Compiling simplebackups (1 of 1)`,
+every packed source byte-identical to this tree (`../_shared/evidence/simplebackups-e2e/build-record.txt`).
+Scenario M's transcript (`e2e-launcher.log`):
+
+```
+game log (/home/adlf/.cache/horizon-e2e/scratch/simplebackups-gamelog.OCsB83/game/logs/latest.log) line: [11:12:39] [Server thread/INFO]: Starting integrated minecraft server version 26.3
+zip entries: 14
+backup.log holds the exact line chosen from the scratch latest.log
+== scenario M counterfactual: capture_latest_log=false packs no backup.log ==
+game log (.../simplebackups-gamelog.fsp95s/game/logs/latest.log) line: [11:12:49] [Server thread/INFO]: Starting integrated minecraft server version 26.3
+counterfactual: capture_latest_log=false packed no backup.log
+PASS: … a concrete line from the scratch latest.log is captured as a flat backup.log entry and capture_latest_log=false packs no such entry (scenario M) …
+EXIT:0
+```
+
+`SELFTEST=latestlog` (`e2e-launcher-gamelog-selftest.log`) inverts the entry assertion and ends
+`FAIL: GAMELOG SELFTEST: backup.log held the chosen line — the assertion is alive` + `EXIT:1`.
+All twelve earlier families (A–L/L2) stayed green on the 0.2.9 game; the control game's leg fails
+at scenario A (`EXIT:1`), `SELFTEST=1`, `SELFTEST=pause`, `SELFTEST=ticks`, `SELFTEST=chain`,
+`SELFTEST=noplayer`, `STALE_SELFTEST=1`, `ADOPT_NEGATIVE=1`, `SAME_SECOND_NEGATIVE=1` all `EXIT:1`.
+`check-e2e-logs.py simplebackups-e2e --strict` → `logs=14 ok=14 missing-exit=0 bad-exit=0`.
+
+**Remote build path.** Every cargo ladder step forwarded through
+`ports/tools/build-slot.sh run --job W1-simplebackups --port ports/simplebackups --step …` to host
+**AdLf-PC** (`build-slot: forwarding … to the remote runner`); `BUILD_LOCAL=1` was never set. The
+launcher native build and every game leg stayed local (`FORWARDED=1` on the launcher build), because
+the second box has no launcher/Nightly cache. All e2e scratch dirs came from `E2E_TMP` under
+`~/.cache/horizon-e2e/scratch` — never `/tmp`.
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review
+
+### Changelog (0.2.9)
+
+> **0.2.9 — the game log goes into the backup.** `capture_latest_log` (upstream's
+> `captureLatestLog`, default true) appends the game's `logs/latest.log` to every archive as one flat
+> `backup.log` entry, after the world walk. The path is resolved from the game's own directory —
+> `host.instance_dir()` (the launcher's production layout) and the launcher's `HORIZON_HOME` (the
+> harness layout) — never from a hardcoded absolute path; a symlink, an absolute path, `..` and any
+> path that canonicalises outside that root are refused. The config key, a flat entry-name rule and
+> the guarded read are all that changed; no new hook, crate, block entity or menu. 77 tests;
+> scenario M proves an exact line from the scratch log is in the archive, the key-off scene packs no
+> entry, and `SELFTEST=latestlog` proves the assertion can fail. 65,996 B, sha256 `53a767bb…`.
+

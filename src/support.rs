@@ -28,14 +28,15 @@ use mod_api::{
 };
 
 use crate::runtime::{
-    ADOPTION_FILE, Adoption, Archive, BackupKind, CHAIN_FILE, ChainState, MANIFEST_ENTRY,
-    NO_PLAYER_FILE, PAUSE_FILE, SCHEDULE_FILE, Settings, backup_file_name, cap_removals,
-    chain_manifest, changed_threshold, choose_kind, copy_is_stale, due_by_millis, due_by_ticks,
-    entry_changed, entry_name, format_adoptions, format_chain, format_no_player_count,
-    format_paused, format_schedule_ticks, format_size, format_size_setting, full_timer_due,
-    is_adopted, manifest_identifies, merge_order, parse, parse_adoptions, parse_archive,
-    parse_chain, parse_no_player_count, parse_paused, parse_schedule_ticks, prune,
-    schedule_progress, scheduled_backup_permitted, should_skip, to_toml,
+    ADOPTION_FILE, Adoption, Archive, BACKUP_LOG_ENTRY, BackupKind, CHAIN_FILE, ChainState,
+    GAME_LOG_RELATIVE, MANIFEST_ENTRY, NO_PLAYER_FILE, PAUSE_FILE, SCHEDULE_FILE, Settings,
+    backup_file_name, backup_log_entry, cap_removals, chain_manifest, changed_threshold,
+    choose_kind, copy_is_stale, due_by_millis, due_by_ticks, entry_changed, entry_name,
+    format_adoptions, format_chain, format_no_player_count, format_paused, format_schedule_ticks,
+    format_size, format_size_setting, full_timer_due, game_log_path, is_adopted,
+    manifest_identifies, merge_order, parse, parse_adoptions, parse_archive, parse_chain,
+    parse_no_player_count, parse_paused, parse_schedule_ticks, prune, schedule_progress,
+    scheduled_backup_permitted, should_skip, to_toml,
 };
 use crate::zip::{ZipWriter, entry_names, read_entry, read_entry_all};
 
@@ -51,6 +52,45 @@ const MAX_RETRIES: u32 = 2;
 /// `retry_on_save` setting, the stale flag and the retry cap decide together.
 fn should_retry(stale: bool, retry_on_save: bool, retries: u32) -> bool {
     stale && retry_on_save && retries < MAX_RETRIES
+}
+
+/// Read the game log from one home folder. The path is checked by the pure rule in
+/// `runtime`, then again on disk: a symlink at either the file or its parent and a
+/// canonical path that escapes `home` are refused. A missing log is not an error —
+/// some launch modes write none — it only means this archive carries no `backup.log`.
+fn read_one_game_log(home: &Path) -> Option<Vec<u8>> {
+    let path = game_log_path(home, GAME_LOG_RELATIVE)?;
+    if !fs::symlink_metadata(&path).ok()?.file_type().is_file() {
+        return None;
+    }
+    let root = fs::canonicalize(home).ok()?;
+    let resolved = fs::canonicalize(&path).ok()?;
+    if !resolved.starts_with(&root) {
+        return None;
+    }
+    fs::read(&path).ok()
+}
+
+/// The game's home folders, in the order the glue tries them. `instance_dir()` is
+/// the path-bearing method of the host's config area (the game folder with `saves/`
+/// and `options.txt`); a dedicated launcher sets `HORIZON_HOME` to that same folder,
+/// so `<home>/logs/latest.log` is the production path. The harness may set
+/// `HORIZON_HOME` beside the instance instead, so its value is a second candidate.
+/// Both are derived from the running game — neither is a hardcoded absolute path.
+fn game_log_homes(host: &dyn ServerHost) -> Vec<PathBuf> {
+    let mut homes = vec![host.instance_dir()];
+    if let Some(home) = std::env::var_os("HORIZON_HOME") {
+        let home = PathBuf::from(home);
+        if !homes.contains(&home) {
+            homes.push(home);
+        }
+    }
+    homes
+}
+
+/// Read the game log from the first home that holds a safe `logs/latest.log`.
+fn read_game_log(homes: &[PathBuf]) -> Option<Vec<u8>> {
+    homes.iter().find_map(|home| read_one_game_log(home))
 }
 
 /// How many ticks a requested save may take before the copy starts without it. A save request
@@ -556,6 +596,9 @@ fn start_backup(host: &mut dyn ServerHost, quiet: bool, empty_scheduled: bool) {
 
 /// Start the worker for the in-flight request: name the file, spawn the copy, tell the players.
 fn begin_copy(host: &mut dyn ServerHost, quiet: bool) {
+    // Resolve the game-log homes on the host thread (where the SDK exposes the game
+    // folder); the worker only reads bytes from the paths it is handed.
+    let log_homes = game_log_homes(host);
     let (cfg, world, name, final_path, backups_prefix, plan) = {
         let mut guard = core();
         let Some(core) = guard.as_mut() else {
@@ -644,6 +687,7 @@ fn begin_copy(host: &mut dyn ServerHost, quiet: bool) {
             &worker_cfg,
             backups_prefix,
             &worker_plan,
+            &log_homes,
         );
         let _ = tx.send(result);
     });
@@ -668,6 +712,7 @@ fn run_backup(
     cfg: &Settings,
     backups_prefix: Option<String>,
     plan: &ChainPlan,
+    log_homes: &[PathBuf],
 ) -> Result<Copy, String> {
     let world_name = world_name(world);
     let part = final_path.with_extension("zip.part");
@@ -724,6 +769,17 @@ fn run_backup(
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.to_string()),
             }
+        }
+        // Upstream reopens the finished archive and appends `backup.log` from
+        // `logs/latest.log` (BackupThread.java:469-498). We add the entry while the
+        // writer is still open — the same bytes, one pass, after the world walk.
+        if cfg.capture_latest_log
+            && let Some(bytes) = read_game_log(log_homes)
+        {
+            let entry = backup_log_entry(BACKUP_LOG_ENTRY)
+                .expect("the backup.log constant is a valid flat entry name");
+            zip.add_bytes(entry, &bytes)
+                .map_err(|error| error.to_string())?;
         }
         let writer = zip.finish().map_err(|error| error.to_string())?;
         let file = writer
@@ -1653,6 +1709,7 @@ mod tests {
             &cfg,
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         )
         .expect("the first copy");
         publish(&mut core_with(&world, cfg.clone()), &first, false).expect("publish first");
@@ -1662,6 +1719,7 @@ mod tests {
             &cfg,
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         )
         .expect("the second copy");
         publish(&mut core_with(&world, cfg.clone()), &second, false).expect("publish second");
@@ -1677,6 +1735,7 @@ mod tests {
             &cfg,
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         )
         .expect("the stale copy");
         let report = publish(&mut core_with(&world, cfg), &stale, true).expect("publish stale");
@@ -1718,6 +1777,7 @@ mod tests {
             &cfg,
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         )
         .expect("the old copy");
         publish(&mut core_with(&world, cfg.clone()), &old, false).expect("publish old");
@@ -1727,6 +1787,7 @@ mod tests {
             &cfg,
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         )
         .expect("the new copy");
         publish(&mut core_with(&world, cfg), &new, false).expect("publish new");
@@ -1770,6 +1831,7 @@ mod tests {
             &cfg,
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         )
         .expect("the first copy");
         publish(&mut core_with(&world, cfg.clone()), &first, false).expect("publish first");
@@ -1779,6 +1841,7 @@ mod tests {
             &cfg,
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         )
         .expect("the second copy");
         publish(&mut core_with(&world, cfg), &second, false).expect("publish second");
@@ -1803,6 +1866,7 @@ mod tests {
             &Settings::default(),
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         )
         .expect("the seed archive");
         publish(
@@ -1817,6 +1881,7 @@ mod tests {
             &Settings::default(),
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         )
         .expect("the fresh copy");
         // keep = 1 and a 1 B cap both want to delete the oldest archive of that second.
@@ -1854,6 +1919,7 @@ mod tests {
             &cfg,
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         )
         .expect("the first copy");
         publish(&mut core_with(&world, cfg.clone()), &first, false).expect("publish first");
@@ -1882,6 +1948,7 @@ mod tests {
             &cfg,
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         )
         .expect("the second copy");
         publish(&mut core_with(&world, cfg), &second, false).expect("publish second");
@@ -1931,6 +1998,7 @@ mod tests {
             &Settings::default(),
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         );
 
         assert!(
@@ -1980,6 +2048,7 @@ mod tests {
             &cfg,
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         )
         .expect("older archive");
         publish(&mut core_with(&world, cfg.clone()), &older, false).expect("publish older");
@@ -1989,6 +2058,7 @@ mod tests {
             &cfg,
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         )
         .expect("newer archive");
         publish(&mut core_with(&world, cfg.clone()), &newer, false).expect("publish newer");
@@ -2032,6 +2102,7 @@ mod tests {
             &cfg,
             Some("backups".to_owned()),
             &full_plan(),
+            &[],
         )
         .expect("our copy");
         publish(&mut core_with(&world, cfg.clone()), &ours, false).expect("publish ours");
@@ -2120,6 +2191,48 @@ mod tests {
             4,
             "the counter must survive being re-read from disk"
         );
+        cleanup(&world);
+    }
+
+    #[test]
+    fn the_game_log_is_read_from_a_safe_path_only() {
+        let world = scratch_world("game-log");
+        let home = world.parent().expect("scratch root").to_path_buf();
+        let logs = home.join("logs");
+        fs::create_dir_all(&logs).expect("logs folder");
+        const LINE: &[u8] =
+            b"[10:46:34] [Server thread/INFO]: Starting integrated minecraft server\n";
+        fs::write(logs.join("latest.log"), LINE).expect("latest.log");
+        assert_eq!(
+            read_game_log(std::slice::from_ref(&home)).as_deref(),
+            Some(LINE),
+            "the exact bytes of latest.log are captured"
+        );
+
+        // A symlink at latest.log must be refused, even when its target is inside the home.
+        let real = logs.join("real.log");
+        fs::write(&real, LINE).expect("real.log");
+        fs::remove_file(logs.join("latest.log")).expect("remove the regular log");
+        symlink(&real, logs.join("latest.log")).expect("plant a log symlink");
+        assert_eq!(
+            read_game_log(std::slice::from_ref(&home)),
+            None,
+            "a symlinked log may not be followed"
+        );
+
+        // A `logs/` folder that resolves outside the game home is refused as well.
+        fs::remove_file(logs.join("latest.log")).expect("remove the symlink");
+        fs::remove_dir_all(&logs).expect("remove the logs folder");
+        let outside = home.parent().expect("outside").join("sb-outside-logs");
+        fs::create_dir_all(&outside).expect("outside logs");
+        fs::write(outside.join("latest.log"), LINE).expect("outside latest.log");
+        symlink(&outside, &logs).expect("plant a logs symlink out of the home");
+        assert_eq!(
+            read_game_log(std::slice::from_ref(&home)),
+            None,
+            "a log that resolves outside the game home is refused"
+        );
+        let _ = fs::remove_dir_all(&outside);
         cleanup(&world);
     }
 }

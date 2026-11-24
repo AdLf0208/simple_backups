@@ -26,7 +26,11 @@ suppresses only the schedule, and a manual backup still works; 56 tests, scenari
 written beside the world with a staged rename on each save and on close, and restored in
 `ensure_world`, so a restart resumes the interval (upstream's `lastSaved` in `BackupData`); 59 tests,
 scenarios J/J2 green with a `SELFTEST=ticks` inversion. The regex half of the gap stays out of scope
-(R9 forbids a registry dependency).
+(R9 forbids a registry dependency). **0.2.7** (2026-11-24) added incremental chains and merge; 68
+tests, scenario K. **0.2.8** (2026-11-24) is the empty-server policy (`noPlayerBackups` /
+`noPlayerBackupCount`): a pure gate wrapping `shouldRunBackup`, one persisted counter beside the
+world and two new `status` fields; 73 tests, scenarios L/L2, with the playerless branch proven
+unit-first because a `ctl` launch always has its owner online.
 
 **Class + tier** (from `ports/ledger.csv`, per `horizon/docs/modpacks.md`):
 **server-only / logic**. The approach is the **logic shape**: a pure policy
@@ -222,7 +226,7 @@ phase that asserts it.
 | commands `backup` / `status` / `list` / `adopt` | tested | `ctl chat "/simplebackups backup"` and `status` in every scenario, `list` in scenario D: the reply names every archive in the folder, and after a `1 B` cap it no longer names the deleted one; `adopt` in scenario G (confirmed reply, `adopted=1`, and a refusal for a name that is not this world's) |
 | save-overlap retry (`retry_on_save`) | tested | unit test `should_retry`; scenario F forces a real overlap with `ctl save` during a 256 MiB copy (`stale=true`, `saves=6`); scenario C's pause/resume still prints `SKIP` (that path cannot make a save) |
 | `pause` / `unpause` | tested | scenario I: `interval_ticks=40`, a first zip (differential), `/simplebackups pause` → 150 ticks with no new zip and `status` `paused=true` (the `saves=` line, not the whole chat buffer), the persisted flag file read back, a manual `backup` while paused → a fresh zip, `/simplebackups backup unpause` → `paused=false` and exactly one new zip named by `list`; `SELFTEST=pause` (`EXIT:1`) proves the paused-window assertion can fail. The pure rules are `runtime::tests::a_paused_schedule_never_starts_a_backup` and `the_pause_flag_round_trips_through_its_file`, the file round-trip `support::tests::the_pause_flag_is_persisted_beside_the_world` |
-| empty-server policy (`noPlayerBackups`) | not ported | gap; needs a player-presence API and a way to empty the server headless |
+| empty-server policy (`noPlayerBackups` / `noPlayerBackupCount`) | tested | scenario L: `status` reports `players=1` (the harness owner is always online), so the online branch's scheduled backup is asserted and the playerless window is recorded as not producible; scenario L2 runs the same with `no_player_backups = true`; the empty branch and the zero/count cap are proven by `runtime::tests::{an_empty_server_never_schedules_by_default,no_player_count_caps_backups_per_empty_period}`, the file round-trip by `support::tests::the_no_player_counter_is_persisted_beside_the_world` |
 | `latest.log` → `backup.log` | not ported | gap (needs a path outside the world folder) |
 | disk reservation before a copy | not ported | gap (upstream's `NotEnoughDiskSpaceException`) |
 | persisted schedule counter (tick mode) | tested | scenario J: a zip before quit, the state file beside the world confirmed and seeded to `ticks = 10`, `ctl quit` + relaunch of the same world, `ticks=<restored ≥ 10>` parsed from the newest status line, an empty window sized from the restored value, then a fresh zip (`check_zip` CRC + manifest); `SELFTEST=ticks` (`EXIT:1`) inverts the restored value; pure rules `runtime::tests::{the_persisted_tick_counter_round_trips_through_its_file, a_restored_counter_resumes_the_interval}`, file round-trip `support::tests::the_schedule_counter_is_persisted_beside_the_world`; scenario J2 is the fresh-world differential (no state file, `ticks=0`, needs the full interval) |
@@ -917,6 +921,152 @@ during one zip check).
 > base/changed-entry rule, `chain=2`, `list`, merge and the fresh-world `chain=1` differential in
 > game. 60,637 B, sha256 `f02f1aa1…`.
 
+## Slice 8 (0.2.8, 2026-11-24) — the empty-server policy
+
+**Gap line.** The coverage table above: *"empty-server policy (`noPlayerBackups`) | not ported |
+gap; needs a player-presence API and a way to empty the server headless"*, and *Gaps after the
+migration* item 4. The first half is now available: at pin `0a875da` the SDK's players service
+(`host.players().server_players()` → `native_server_players()`) reports the server player list.
+The second half is **not** available through `horizon-ctl` (see the harness limit below), so the
+empty branch is proven unit-first rather than faked in game. Class **server-only**, tier **logic**
+(ledger authority). Shape: two config keys, one pure gate, one persisted counter beside the world,
+two extra fields on the existing `saves=` status line. No new hook, block entity, menu, renderer,
+carried content or dependency. Regex ignores stay `not ported` (R9 forbids a registry dependency).
+
+**Upstream policy (re-read from the re-cloned `1.21.1` head `bf04de3e7b3e05504ee5cc974cf45833b0d4b9a4`,
+`ports/_shared/upstream/simplebackups-src`, deleted after these findings were recorded).**
+`EventListener.java:43` defines "no player online" as the **server player list being empty**
+(`!server.getPlayerList().getPlayers().isEmpty()` is false), not a timeout since the last input and
+not per shutdown: the counter is **per empty period**, reset on a join. `:44-50`: with nobody
+online the tick proceeds only when `noPlayerBackups` is set **and** `noPlayerBackupCount != 0` **and**
+`backupsSinceLastPlayerJoined < noPlayerBackupCount`. With a player online the gate is bypassed.
+`:52-57`: the counter increments when the backup is **started** (not when it finishes), and only
+for an empty-server scheduled backup. `:64-66`: `PlayerLoggedInEvent` resets the counter;
+`:74-81` re-enables the gate when the last player leaves. `BackupData.java:18,32,50,81-97` stores
+the counter in the `simplebackups` SavedData, so it survives a restart. `CommonConfig.java:86-89`:
+`noPlayerBackups` defaults to `false`, `noPlayerBackupCount` to `1`, and `0` disables empty-server
+backups. `BackupThread.java:103-107,115-123` keeps `shouldRunBackup`'s enabled/paused/due gate, so
+the presence rule **wraps** it rather than replacing it. Upstream's separate `noPlayerBackupTimer`
+(`:90-91,151-157`, default 0 → use `timer`) is out of this brief's scope: the empty period uses the
+same `interval_ticks`/`interval_minutes` and this deviation is recorded.
+
+**Port decisions.** `runtime.rs` gains `scheduled_backup_permitted(enabled, paused, online,
+no_player_backups, count, since)` (the presence rule wrapping `schedule_allowed`), `format_no_player_count`
+/ `parse_no_player_count`, and the two `Settings` keys with their defaults and round-trip. `Core`
+gains `players`, `seen_players` and `empty_backups`; `NO_PLAYER_FILE = "simplebackups-no-player.txt"`
+lives beside the world (not in the deletable backup folder), is read in `ensure_world` (the SavedData
+load moment) and written with a staged rename on each change/save/close. With no new hook available,
+upstream's login reset is detected on the **empty→player transition** sampled at each tick (including
+the owner's join as the world opens). `start_backup` increments the counter only for a scheduled
+backup started while empty, exactly at upstream's `tryCreateBackup` moment. `/simplebackups status`
+appends `players=<n> empty_backups=<n>` to the existing `saves=` line; earlier substring assertions
+stay valid. A manual backup ignores the presence rule, as upstream's `createBackup` ignores
+`shouldRunBackup`. The seven earlier slices' behaviour is unchanged.
+
+**Harness limit (measured, not assumed).** `horizon-ctl launch` opens a single-player integrated
+world whose owner connects through the local hub, so `host.players().server_players()` is non-empty
+for the entire run. `ctl disconnect` refuses outside a remote server, and there is no dedicated
+launch in the harness. Scenario L's first `status` measured `players=1 empty_backups=0` on both the
+0.2.8 game (`e2e-launcher.log`) and the diagnostic (`e2e-launcher-noplayer-diag.log`; the game's own
+`state` reply names the joined owner). A genuinely playerless interval therefore **cannot** be
+produced here, exactly the fallback the brief allows: no chat command is dressed up as an empty
+server. The empty branch, the `0` disables rule and the `count` cap are proven red-first in pure
+tests; the in-game leg asserts the online branch and reports the observed player count.
+
+**Red → green.** Five failing tests first, against stubs (`sdk-test-red-noplayer.log`; verbatim):
+
+```
+---- runtime::tests::an_empty_server_never_schedules_by_default stdout ----
+thread 'runtime::tests::an_empty_server_never_schedules_by_default' (563117) panicked at src/runtime.rs:1877:9:
+assertion failed: !scheduled_backup_permitted(true, false, false, false, 1, 0)
+
+---- runtime::tests::no_player_count_caps_backups_per_empty_period stdout ----
+thread 'runtime::tests::no_player_count_caps_backups_per_empty_period' (563131) panicked at src/runtime.rs:1886:9:
+assertion failed: !scheduled_backup_permitted(true, false, false, true, 0, 0)
+
+---- runtime::tests::no_player_keys_round_trip_through_the_config stdout ----
+thread 'runtime::tests::no_player_keys_round_trip_through_the_config' (563132) panicked at src/runtime.rs:1909:9:
+["unknown key: no_player_backups", "unknown key: no_player_backup_count"]
+
+---- runtime::tests::the_empty_backup_counter_round_trips_through_its_file stdout ----
+thread 'runtime::tests::the_empty_backup_counter_round_trips_through_its_file' (563150) panicked at src/runtime.rs:1899:9:
+assertion `left == right` failed
+  left: ""
+ right: "backups = 3\n"
+
+---- support::tests::the_no_player_counter_is_persisted_beside_the_world stdout ----
+thread 'support::tests::the_no_player_counter_is_persisted_beside_the_world' (563167) panicked at src/support.rs:2060:9:
+assertion `left == right` failed: the counter must survive being re-read from disk
+  left: 0
+ right: 4
+
+test result: FAILED. 68 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+```
+
+Green: **73 passed, 0 failed** — `sdk-test.log`, clippy `-D warnings` 0 warnings (`sdk-clippy.log`),
+`fmt --check` clean (`sdk-fmt.log`). Clippy caught one redundant boolean in the join detection; it
+was rewritten as a named `player_joined` condition rather than allowed.
+
+**In game.** Launcher build `native-0a875da-9f57a9d12e7e`, `Compiling simplebackups (1 of 1)`,
+every packed source byte-identical to this tree (`../_shared/evidence/simplebackups-e2e/build-record.txt`).
+Scenario L's transcript (`e2e-launcher.log`):
+
+```
+no-player status (before): saves=0 retries=0 stale=false paused=false ticks=20 chain=0 players=1 empty_backups=0
+harness: the owner is online (players=1); a genuinely playerless interval is not producible by ctl
+online-window assertion: a scheduled backup appeared with players=1
+zip entries: 13
+no-player status (after): saves=0 retries=0 stale=false paused=false ticks=9 chain=1 players=1 empty_backups=0
+```
+
+Scenario L2 repeats with `no_player_backups = true` and `no_player_backup_count = 1` (`players=1
+empty_backups=0` before and after, a fresh zip at `interval_ticks=40`); the owner is again online
+and the schedule still produces a zip. `SELFTEST=noplayer` (`e2e-launcher-noplayer-selftest.log`)
+inverts the online-window assertion — `FAIL: NOPLAYER SELFTEST: a scheduled backup appeared with a
+player online — the online-window assertion is alive (no empty window was available to invert)` +
+`EXIT:1` — and is explicitly **not** presented as the empty-window inversion, which the harness
+cannot run. All ten earlier scenario legs stayed green on the 0.2.8 game; control `EXIT:1`,
+`SELFTEST=1`, `SELFTEST=pause`, `SELFTEST=ticks`, `SELFTEST=chain`, `SELFTEST=noplayer`,
+`STALE_SELFTEST=1`, `ADOPT_NEGATIVE=1`, `SAME_SECOND_NEGATIVE=1` all `EXIT:1`.
+`check-e2e-logs.py simplebackups-e2e --strict` → `logs=11 ok=11 missing-exit=0 bad-exit=0`.
+
+### Package 0.2.8
+
+| | |
+|---|---|
+| version | **0.2.8** (`horizon-mod.toml` + `Cargo.toml`) |
+| bytes | **63,311 B** |
+| sha256 | `843d9fd8ba3aba26ba0f03e3fe9b295dc30efa182afa75e19466e94a39ebb117` |
+| entries | **10** — `horizon-mod.toml`, `Cargo.toml`, `LICENSE`, `LICENSE-NOTICE.md`, `README.md`, `src/{lib,runtime,support,zip}.rs`, `uses.json`; **no `Cargo.lock`** |
+| reproducible | two builds, each after `rm -f Cargo.lock`: identical sha and `cmp` |
+| `check` | `simplebackups 0.2.8 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, 63,311 B, exit 0 |
+| `fits --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `0a875da  made for` (the pin tautology) |
+| `fits --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `0b14f8a  fits` — the real gate |
+| tests | **73 passed, 0 failed** (39 `runtime` → 43, 12 `support` → 13, 12 `zip`) |
+| `verify-sdk-package.py simplebackups` | `1/1`, `package matches the tree`, R9 clean |
+
+**Remote build path.** Every cargo ladder step forwarded through
+`ports/tools/build-slot.sh run --job W1-simplebackups --port ports/simplebackups --step …` to host
+**AdLf-PC** (`build-slot: forwarding … to the remote runner`); `BUILD_LOCAL=1` was never set. The
+launcher native build and every game leg stayed local (`FORWARDED=1`), because the second box has no
+`horizon-launcher` or Nightly versions cache. All e2e scratch dirs came from `E2E_TMP` under
+`~/.cache/horizon-e2e/scratch` — never `/tmp`.
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices
+
+### Changelog (0.2.8)
+
+> **0.2.8 — the empty-server policy.** With `noPlayerBackups=false` (upstream's default) the
+> schedule is silent while the server player list is empty; opting in with `noPlayerBackups=true`
+> allows at most `noPlayerBackupCount` backups (default 1, 0 disables) per empty period until a
+> player joins. The counter is incremented when an empty-server backup **starts** and resets when a
+> player joins, and is persisted in `simplebackups-no-player.txt` beside the world (upstream's
+> `backupsSinceLastPlayerJoined` SavedData). `/simplebackups status` reports `players=<n>
+> empty_backups=<n>`. A manual backup ignores the presence rule. Upstream's separate
+> `noPlayerBackupTimer` is not ported. Regex ignores stay out of scope (R9). 73 tests; scenario L
+> proves the online branch with the observed player count, and the empty branch is proven red-first
+> by pure tests because a `ctl` launch always has the owner online. 63,311 B, sha256 `843d9fd8…`.
+
 ## Verification (re-pin `83ad384f`, 2026-11-06/07)
 
 
@@ -973,8 +1123,11 @@ works while disabled`.
 - The schedule counter is now persisted across restarts (slice 6): the progress toward the next
   backup is written beside the world and restored when it opens, so a restart resumes the interval
   instead of starting at zero. Only tick-mode progress is stored; a wall-clock interval still starts
-  at world open (the game's own wall clock is not available through the SDK). Empty-server policy,
-  `latest.log` capture, Cherished Worlds/mc2discord and regex ignores stay deferred. The disk cap
+  at world open (the game's own wall clock is not available through the SDK). The empty-server
+  policy is now ported (slice 8) — a `ctl` launch always has the world owner placed, so its
+  playerless branch is proven by unit tests, not in game; upstream's separate `noPlayerBackupTimer`
+  stays a deviation (the empty period uses the same interval). `latest.log` capture, Cherished
+  Worlds/mc2discord and regex ignores stay deferred. The disk cap
   (slice 2), `pause`/`unpause` (slice 5), the persisted counter (slice 6) and incremental
   chains/merge (slice 7) are now ported. Chain children are not standalone restore points; the flat
   retention (slice 3/4) still prunes by archive identity and is not chain-aware — deliberately
@@ -1045,8 +1198,9 @@ works while disabled`.
   `WorldCloseFinal`; do not read it in `server_about_to_start`.
   `native_config_dir()` is static and safe anywhere.
 - **Deferred (as of the 2026-11-03 analysis; pause and the disk cap were later ported — slices 5
-  and 2):** incremental/chains/merge, `latest.log` capture, empty-server policy, Cherished Worlds,
-  mc2discord, regex ignores, persisted schedule, sync-copy mode.
+  and 2; the persisted schedule slice 6, chains/merge slice 7, empty-server policy slice 8):**
+  `latest.log` capture, Cherished Worlds, mc2discord, regex ignores, sync-copy mode, and upstream's
+  separate `noPlayerBackupTimer`.
 - **Licence:** Apache-2.0 permits derivatives, but the port stays local-only
   until the maintainer approves publishing (ARCHITECTURE.md §8). The scaffold's
   `Cargo.toml` currently declares `MIT` while upstream is Apache-2.0; the
@@ -1217,11 +1371,11 @@ remote runner. Evidence in `../_shared/evidence/simplebackups/`.
    pinned compressor crate (or ships a `deflate` helper) closes it.
 3. **The 0.1.0 harness logs are gone** (`target/horizon-test.log`, `target/G9-e2e.log` lived in
    `target/`, which the disk-hygiene rule cleans); the transcript quoted in this file is the record.
-4. Still deferred: `latest.log` capture, the empty-server policy, Cherished Worlds/mc2discord and
-   regex ignores (**the disk cap is done — *Slice 2 (0.2.2)* —, pause/unpause — *Slice 5 (0.2.5)* —,
-   the persisted tick schedule — *Slice 6 (0.2.6)* —, and incremental chains/merge — *Slice 7
-   (0.2.7)*; only the regex half of the old combined gap remains, and R9 forbids the crate it
-   would need**).
+4. Still deferred: `latest.log` capture, Cherished Worlds/mc2discord and regex ignores (**the disk
+   cap is done — *Slice 2 (0.2.2)* —, pause/unpause — *Slice 5 (0.2.5)* —, the persisted tick
+   schedule — *Slice 6 (0.2.6)* —, incremental chains/merge — *Slice 7 (0.2.7)* —, and the
+   empty-server policy — *Slice 8 (0.2.8)*; only the regex half of the old combined gap remains,
+   and R9 forbids the crate it would need**).
 5. `/simplebackups status` is the only route for a config warning; there is no log file.
 6. `side = "both"`, so the mod is installed on a client too; that is required for single player and
    a LAN host (their integrated server belongs to the client installation).

@@ -66,10 +66,19 @@ the game glue and `src/zip.rs` the archive writer. The launcher compiles it agai
   upstream's `paused` field in its `BackupData` SavedData. `/simplebackups status` reports
   `paused=<bool>`. The client-side red HUD banner the jar sends over its `Pause` packet is not
   ported (a `client`/UI half, outside this server-only logic port).
+- **Empty-server policy:** by default (`noPlayerBackups = false`, upstream's default) the schedule
+  runs only while the server player list is non-empty, so an empty dedicated server makes no
+  scheduled backups. Opting in with `noPlayerBackups = true` allows at most `noPlayerBackupCount`
+  backups (default 1; 0 disables) during one empty period; the count is incremented when a backup
+  **starts** while empty and resets when a player joins, and it is persisted in
+  `simplebackups-no-player.txt` beside the world (upstream's `backupsSinceLastPlayerJoined` in its
+  `BackupData` SavedData). A manual backup is unaffected. Upstream's separate `noPlayerBackupTimer`
+  is not ported: the empty period uses the same `interval_ticks`/`interval_minutes`. `/simplebackups
+  status` reports `players=<n> empty_backups=<n>`.
 - **Config** `config/simplebackups.toml`: `enabled`, `interval_minutes`, `interval_ticks`, `keep`,
   `max_disk_size`, `compression_level`, `save_before_backup`, `retry_on_save`, `broadcast`,
-  `backups_dir`, `ignored_paths`, `ignored_files`, `backup_type`, `full_backup_timer`. A missing
-  file is written with the defaults.
+  `backups_dir`, `ignored_paths`, `ignored_files`, `backup_type`, `full_backup_timer`,
+  `no_player_backups`, `no_player_backup_count`. A missing file is written with the defaults.
 
 ## Notes on this port
 

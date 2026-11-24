@@ -29,6 +29,11 @@ pub struct Settings {
     pub backup_type: BackupType,
     /// How long an incremental chain runs before the next base is forced (minutes).
     pub full_backup_timer_minutes: u64,
+    /// Back up on the schedule while nobody is online (upstream `noPlayerBackups`).
+    pub no_player_backups: bool,
+    /// How many empty-server backups per period until a player joins (upstream
+    /// `noPlayerBackupCount`; 0 disables them).
+    pub no_player_backup_count: u64,
 }
 
 impl Default for Settings {
@@ -49,6 +54,8 @@ impl Default for Settings {
             // Upstream ships full backups by default; chains are an experimental opt-in.
             backup_type: BackupType::Full,
             full_backup_timer_minutes: DEFAULT_FULL_BACKUP_TIMER_MINUTES,
+            no_player_backups: false,
+            no_player_backup_count: 1,
         }
     }
 }
@@ -179,6 +186,14 @@ pub fn parse(input: &str) -> (Settings, Vec<String>) {
                 Ok(parsed) => config.full_backup_timer_minutes = parsed,
                 Err(_) => warnings.push(format!("full_backup_timer: not a number: {value}")),
             },
+            "no_player_backups" => match parse_bool(value) {
+                Some(parsed) => config.no_player_backups = parsed,
+                None => warnings.push(format!("no_player_backups: not a boolean: {value}")),
+            },
+            "no_player_backup_count" => match value.parse::<u64>() {
+                Ok(parsed) => config.no_player_backup_count = parsed,
+                Err(_) => warnings.push(format!("no_player_backup_count: not a number: {value}")),
+            },
             other => warnings.push(format!("unknown key: {other}")),
         }
     }
@@ -246,6 +261,14 @@ pub fn to_toml(config: &Settings) -> String {
         "full_backup_timer = {}\n",
         config.full_backup_timer_minutes
     ));
+    out.push_str(&format!(
+        "no_player_backups = {}\n",
+        config.no_player_backups
+    ));
+    out.push_str(&format!(
+        "no_player_backup_count = {}\n",
+        config.no_player_backup_count
+    ));
     out
 }
 
@@ -258,6 +281,42 @@ pub fn due_by_ticks(last_tick: u64, now_tick: u64, interval: u64) -> bool {
 pub fn due_by_millis(last_ms: u64, now_ms: u64, interval_minutes: u64) -> bool {
     interval_minutes > 0
         && now_ms.saturating_sub(last_ms) >= interval_minutes.saturating_mul(60_000)
+}
+
+/// The persisted empty-server counter, stored beside the world. Upstream keeps
+/// `backupsSinceLastPlayerJoined` in its `BackupData` SavedData, so it survives a restart.
+pub const NO_PLAYER_FILE: &str = "simplebackups-no-player.txt";
+
+/// Whether a scheduled backup may start with the given player presence and empty-server policy.
+/// Upstream's player-presence rule wraps `shouldRunBackup`: the enabled/paused/due gate still
+/// applies, and with nobody online the schedule only runs when `no_player_backups` is on and the
+/// per-period count has not been used up.
+pub fn scheduled_backup_permitted(
+    enabled: bool,
+    paused: bool,
+    players_online: bool,
+    no_player_backups: bool,
+    no_player_backup_count: u64,
+    backups_since_player: u64,
+) -> bool {
+    if !schedule_allowed(enabled, paused) {
+        return false;
+    }
+    players_online
+        || (no_player_backups
+            && no_player_backup_count != 0
+            && backups_since_player < no_player_backup_count)
+}
+
+/// The one line this port writes for the persisted empty-server counter.
+pub fn format_no_player_count(count: u64) -> String {
+    format!("backups = {count}\n")
+}
+
+/// Read the persisted counter. Only an exact line this port writes counts: an absent,
+/// malformed or hand-edited file starts a fresh empty period (zero backups).
+pub fn parse_no_player_count(text: &str) -> Option<u64> {
+    text.trim().strip_prefix("backups = ")?.parse::<u64>().ok()
 }
 
 /// The persisted pause flag, stored beside the world. Upstream keeps `paused` in its
@@ -1830,5 +1889,61 @@ mod tests {
             [base, children[1].clone()],
             "a differential merge needs only the full and the newest child"
         );
+    }
+
+    #[test]
+    fn an_empty_server_never_schedules_by_default() {
+        // Upstream: noPlayerBackups=false means no scheduled backup while nobody is online.
+        assert!(!scheduled_backup_permitted(true, false, false, false, 1, 0));
+        // With a player online the same config still schedules.
+        assert!(scheduled_backup_permitted(true, false, true, false, 1, 0));
+    }
+
+    #[test]
+    fn no_player_count_caps_backups_per_empty_period() {
+        // 0 disables empty-server backups; 1 allows one until a player joins and resets it;
+        // 2 allows two. The counter is per empty period, not per save or per shutdown.
+        assert!(!scheduled_backup_permitted(true, false, false, true, 0, 0));
+        assert!(scheduled_backup_permitted(true, false, false, true, 1, 0));
+        assert!(!scheduled_backup_permitted(true, false, false, true, 1, 1));
+        assert!(scheduled_backup_permitted(true, false, false, true, 2, 1));
+        assert!(!scheduled_backup_permitted(true, false, false, true, 2, 2));
+        // The presence rule wraps the existing shouldRunBackup gate.
+        assert!(!scheduled_backup_permitted(false, false, false, true, 1, 0));
+        assert!(!scheduled_backup_permitted(true, true, false, true, 1, 0));
+        assert!(scheduled_backup_permitted(true, false, true, true, 1, 9));
+    }
+
+    #[test]
+    fn the_empty_backup_counter_round_trips_through_its_file() {
+        assert_eq!(format_no_player_count(3), "backups = 3\n");
+        assert_eq!(parse_no_player_count("backups = 3\n"), Some(3));
+        assert_eq!(
+            parse_no_player_count(""),
+            None,
+            "a world that never backed up empty"
+        );
+        assert_eq!(
+            parse_no_player_count("backups = nope\n"),
+            None,
+            "a hand-edited file"
+        );
+        assert_eq!(parse_no_player_count("backups = 3 extra\n"), None);
+    }
+
+    #[test]
+    fn no_player_keys_round_trip_through_the_config() {
+        let (config, warnings) = parse("no_player_backups = true\nno_player_backup_count = 2\n");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(config.no_player_backups);
+        assert_eq!(config.no_player_backup_count, 2);
+        let defaults = Settings::default();
+        assert!(!defaults.no_player_backups, "upstream's default is false");
+        assert_eq!(defaults.no_player_backup_count, 1);
+        let (round_trip, warnings) = parse(&to_toml(&config));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(round_trip, config);
+        let (_, warnings) = parse("no_player_backup_count = -1\nno_player_backups = yes\n");
+        assert_eq!(warnings.len(), 2, "bad values keep the defaults and warn");
     }
 }

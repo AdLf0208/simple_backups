@@ -29,12 +29,13 @@ use mod_api::{
 
 use crate::runtime::{
     ADOPTION_FILE, Adoption, Archive, BackupKind, CHAIN_FILE, ChainState, MANIFEST_ENTRY,
-    PAUSE_FILE, SCHEDULE_FILE, Settings, backup_file_name, cap_removals, chain_manifest,
-    changed_threshold, choose_kind, copy_is_stale, due_by_millis, due_by_ticks, entry_changed,
-    entry_name, format_adoptions, format_chain, format_paused, format_schedule_ticks, format_size,
-    format_size_setting, full_timer_due, is_adopted, manifest_identifies, merge_order, parse,
-    parse_adoptions, parse_archive, parse_chain, parse_paused, parse_schedule_ticks, prune,
-    schedule_allowed, schedule_progress, should_skip, to_toml,
+    NO_PLAYER_FILE, PAUSE_FILE, SCHEDULE_FILE, Settings, backup_file_name, cap_removals,
+    chain_manifest, changed_threshold, choose_kind, copy_is_stale, due_by_millis, due_by_ticks,
+    entry_changed, entry_name, format_adoptions, format_chain, format_no_player_count,
+    format_paused, format_schedule_ticks, format_size, format_size_setting, full_timer_due,
+    is_adopted, manifest_identifies, merge_order, parse, parse_adoptions, parse_archive,
+    parse_chain, parse_no_player_count, parse_paused, parse_schedule_ticks, prune,
+    schedule_progress, scheduled_backup_permitted, should_skip, to_toml,
 };
 use crate::zip::{ZipWriter, entry_names, read_entry, read_entry_all};
 
@@ -137,6 +138,16 @@ struct Core {
     warnings: Vec<String>,
     /// Incremental-chain state persisted beside the world (upstream's `BackupData`).
     chain: ChainState,
+    /// Players the last tick saw on the server (`host.players().server_players()`). Upstream's
+    /// rule uses the player list, which includes the single-player owner; a native mod reads it
+    /// through the SDK's players service.
+    players: usize,
+    /// Whether this world has taken its first presence sample. The owner joins as the world
+    /// opens, so that first sample is a join too and resets the persisted counter.
+    seen_players: bool,
+    /// Backups made while the server was empty since the last player joined (upstream's
+    /// `BackupData.backupsSinceLastPlayerJoined`, persisted beside the world).
+    empty_backups: u64,
 }
 
 /// The session state. `Hooks: Send + Sync`, so it is a `Mutex`, and the macro boxes one
@@ -198,6 +209,7 @@ pub fn on_world_lifecycle(phase: mod_api::WorldPhase) {
     match phase {
         mod_api::WorldPhase::WorldCloseFinal | mod_api::WorldPhase::WorldCloseFailed => {
             persist_schedule(core);
+            persist_no_player(core);
             persist_chain(core);
             core.world = None;
             core.closing = true;
@@ -228,6 +240,7 @@ pub fn on_server_stopping() {
     let mut guard = core();
     let core = guard.get_or_insert_with(Core::default);
     persist_schedule(core);
+    persist_no_player(core);
     persist_chain(core);
     core.closing = true;
     abandon_save_wait(core);
@@ -251,6 +264,11 @@ fn ensure_world(host: &dyn ServerHost) {
     }
     core.paused = read_paused(&dir);
     core.chain = read_chain(&dir);
+    // Upstream loads `backupsSinceLastPlayerJoined` from its SavedData here. The first tick's
+    // player sample decides whether the restored value is still part of this empty period.
+    core.empty_backups = read_no_player_count(&dir);
+    core.players = 0;
+    core.seen_players = false;
     // Upstream loads `lastSaved` from its `BackupData` SavedData here. We stored the *progress*
     // toward the next backup, so restoring it as `ticks = saved, last_tick = 0` makes the due
     // check fire after the remaining interval instead of restarting it at world open.
@@ -283,6 +301,7 @@ pub fn on_world_saved(host: &mut dyn ServerHost, _wait: bool) {
         // A save is upstream's checkpoint moment: `lastSaved` lives in a SavedData the game writes
         // on the same cycle, so snapshotting progress here makes a crash-safe restart possible too.
         persist_schedule(core);
+        persist_no_player(core);
         core.waiting_save.take()
     };
     if let Some(quiet) = waiting {
@@ -415,12 +434,23 @@ pub fn on_server_tick(host: &mut dyn ServerHost, world_running: bool) {
         }
     }
 
-    let manual = {
+    let players = host.players().server_players().len();
+    let (manual, empty_scheduled) = {
         let mut guard = core();
         let Some(core) = guard.as_mut() else {
             return;
         };
         core.ticks += 1;
+        // Upstream resets `backupsSinceLastPlayerJoined` on `PlayerLoggedInEvent`. With no new
+        // hook at this pin, the empty→player transition (including the owner's join as the world
+        // opens) is the same moment: a fresh empty period starts when somebody is present again.
+        let player_joined = players > 0 && (!core.seen_players || core.players == 0);
+        if player_joined && core.empty_backups != 0 {
+            core.empty_backups = 0;
+            persist_no_player(core);
+        }
+        core.seen_players = true;
+        core.players = players;
         if core.closing {
             core.pending = None;
             return;
@@ -432,29 +462,39 @@ pub fn on_server_tick(host: &mut dyn ServerHost, world_running: bool) {
             }
             return;
         }
-        // Upstream's `shouldRunBackup` also refuses while paused. A queued manual request bypasses
-        // this gate entirely, exactly as upstream's `createBackup` bypasses `shouldRunBackup`.
-        let due = schedule_allowed(core.cfg.enabled, core.paused)
-            && if core.cfg.interval_ticks > 0 {
-                due_by_ticks(core.last_tick, core.ticks, core.cfg.interval_ticks)
-            } else {
-                due_by_millis(core.last_ms, now_ms(), core.cfg.interval_minutes)
-            };
+        // The presence rule wraps `shouldRunBackup`: the enabled/paused/due gate still applies,
+        // and with nobody online the schedule only runs while `noPlayerBackups` allows another
+        // backup in this empty period. A queued manual request bypasses both, as upstream's
+        // `createBackup` bypasses `shouldRunBackup`.
+        let due = scheduled_backup_permitted(
+            core.cfg.enabled,
+            core.paused,
+            players > 0,
+            core.cfg.no_player_backups,
+            core.cfg.no_player_backup_count,
+            core.empty_backups,
+        ) && if core.cfg.interval_ticks > 0 {
+            due_by_ticks(core.last_tick, core.ticks, core.cfg.interval_ticks)
+        } else {
+            due_by_millis(core.last_ms, now_ms(), core.cfg.interval_minutes)
+        };
         if manual.is_none() && !due {
             return;
         }
-        manual
+        (manual, manual.is_none() && players == 0)
     };
     let Some(quiet) = manual else {
-        // Scheduled: not quiet.
-        start_backup(host, false);
+        // Scheduled: not quiet, and an empty-server backup consumes one of the period's count.
+        start_backup(host, false, empty_scheduled);
         return;
     };
-    start_backup(host, quiet);
+    start_backup(host, quiet, false);
 }
 
-/// A backup is due or queued: save the open levels (or not), then start the copy.
-fn start_backup(host: &mut dyn ServerHost, quiet: bool) {
+/// A backup is due or queued: save the open levels (or not), then start the copy. `empty_scheduled`
+/// says this was the schedule running with nobody online: upstream counts it the moment the worker
+/// starts (`EventListener.java:52-57`), not when the copy is published.
+fn start_backup(host: &mut dyn ServerHost, quiet: bool, empty_scheduled: bool) {
     let (cfg, world) = {
         let mut guard = core();
         let Some(core) = guard.as_mut() else {
@@ -484,6 +524,10 @@ fn start_backup(host: &mut dyn ServerHost, quiet: bool) {
             core.in_flight = true;
             core.in_flight_quiet = quiet;
             core.pending = None;
+            if empty_scheduled {
+                core.empty_backups = core.empty_backups.saturating_add(1);
+                persist_no_player(core);
+            }
         }
     }
     if !cfg.save_before_backup {
@@ -875,6 +919,34 @@ fn persist_schedule(core: &Core) {
     if let Some(world) = &core.world {
         let progress = schedule_progress(core.ticks, core.last_tick);
         let _ = write_schedule_ticks(world, progress);
+    }
+}
+
+/// The persisted empty-server counter lives beside the world, like the pause flag.
+fn no_player_path(world: &Path) -> PathBuf {
+    world.join(NO_PLAYER_FILE)
+}
+
+/// Read the counter when a world opens. An absent or hand-edited file means a fresh empty period.
+fn read_no_player_count(world: &Path) -> u64 {
+    fs::read_to_string(no_player_path(world))
+        .ok()
+        .and_then(|text| parse_no_player_count(&text))
+        .unwrap_or(0)
+}
+
+/// Write the counter with a staged rename, so a crash cannot leave a half-written number.
+fn write_no_player_count(world: &Path, count: u64) -> io::Result<()> {
+    let staging = world.join(format!("{NO_PLAYER_FILE}.tmp"));
+    fs::write(&staging, format_no_player_count(count))?;
+    fs::rename(staging, no_player_path(world))
+}
+
+/// Snapshot the counter at the same checkpoints as the pause flag and schedule: a save, a close
+/// and every change (increment, and the reset when a player joins).
+fn persist_no_player(core: &Core) {
+    if let Some(world) = &core.world {
+        let _ = write_no_player_count(world, core.empty_backups);
     }
 }
 
@@ -1353,15 +1425,19 @@ fn status_lines() -> Vec<String> {
     ));
     // `paused`/`ticks` are appended so the earlier substring assertions (saves=/retries=/stale=)
     // stay valid. `ticks` is the persisted progress toward the next scheduled backup: a parsed
-    // reply after a restart proves the counter resumed instead of restarting at zero.
+    // reply after a restart proves the counter resumed instead of restarting at zero. `players`
+    // and `empty_backups` expose the empty-server policy's inputs: the server player list and the
+    // persisted per-period count (a launch whose owner is online reports players>=1).
     lines.push(format!(
-        "saves={} retries={} stale={} paused={} ticks={} chain={}",
+        "saves={} retries={} stale={} paused={} ticks={} chain={} players={} empty_backups={}",
         core.save_seq,
         core.retries,
         core.stale,
         core.paused,
         schedule_progress(core.ticks, core.last_tick),
-        core.chain.len
+        core.chain.len,
+        core.players,
+        core.empty_backups
     ));
     // The disk cap is a config key of its own, so it gets a line of its own: the folder's size after
     // the last publish, the cap it is measured against, and whether it is still over it. The
@@ -2026,6 +2102,23 @@ mod tests {
                 &adoptions
             ),
             "a file replaced since the adoption is not adopted"
+        );
+        cleanup(&world);
+    }
+
+    #[test]
+    fn the_no_player_counter_is_persisted_beside_the_world() {
+        let world = scratch_world("no-player");
+        assert_eq!(
+            read_no_player_count(&world),
+            0,
+            "a world that never backed up while empty starts at zero"
+        );
+        write_no_player_count(&world, 4).expect("write the empty-server counter");
+        assert_eq!(
+            read_no_player_count(&world),
+            4,
+            "the counter must survive being re-read from disk"
         );
         cleanup(&world);
     }

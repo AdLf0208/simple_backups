@@ -60,6 +60,11 @@
 # `chain=1` (the differential). `save_before_backup=false` keeps the game from rewriting other
 # world files between the two backups, so exactly one entry is changed. SELFTEST=chain inverts
 # the manifest/base assertion and exits non-zero.
+# Scenario L: the empty-server policy (noPlayerBackups / noPlayerBackupCount). The harness launches
+# a single-player integrated world, so `status`'s `players=<n>` field decides whether a genuinely
+# empty window is available; when the owner is online, the online branch is asserted instead and the
+# limit is recorded rather than dressing a chat command up as an empty server. SELFTEST=noplayer
+# inverts whichever assertion was actually made.
 #
 # Scenario J2 (differential): a FRESH scratch world has no state file, so its interval starts at
 #   world open (scenario J's seeded counter makes one come 10 ticks sooner). It must wait a full
@@ -247,6 +252,115 @@ backup_type = "$type"
 full_backup_timer = 525960
 ignored_paths = ["dimensions", "region"]
 EOF
+}
+
+# Scenario L config: the empty-server policy. The two keys are upstream's
+# `noPlayerBackups` / `noPlayerBackupCount`; `save_before_backup=false` keeps the
+# scheduled window deterministic (no save cycle between the two status reads).
+write_no_player_config() { # config-dir flag count
+    local dir=$1 flag=$2 count=$3
+    mkdir -p "$dir"
+    cat > "$dir/simplebackups.toml" <<EOF
+enabled = true
+interval_minutes = 0
+interval_ticks = 40
+keep = 3
+compression_level = 1
+save_before_backup = false
+retry_on_save = true
+broadcast = false
+backups_dir = "backups"
+max_disk_size = "25 GB"
+no_player_backups = $flag
+no_player_backup_count = $count
+EOF
+}
+
+# Scenario L: the empty-server policy. `default` is upstream's noPlayerBackups=false;
+# `optin` turns it on with a count of one. A horizon-ctl launch opens a single-player
+# integrated world whose owner is a placed player, so `status`'s new `players=<n>` field
+# decides which assertion can honestly be made: with nobody online the empty window is
+# asserted, otherwise the online branch is asserted and the harness limit is recorded.
+# `selftest` inverts whichever assertion was actually available.
+run_no_player_scenario() { # world sock mode
+    local world=$1 sock=$2 mode=$3
+    local scratch
+    scratch=$(mktemp -d "${E2E_TMP:-/tmp/opencode}/simplebackups-noplayer.XXXXXX")
+    local flag=false count=1
+    [ "$mode" != optin ] || flag=true
+    write_no_player_config "${CONFIG_DIR:-$scratch/config}" "$flag" "$count"
+    launch "$sock" "$scratch" "$GAME" "$world"
+    local ctl
+    ctl() { "$CTL" --socket "$sock" "$@"; }
+    ctl wait-ready 120
+    ctl wait 10
+    local backups="$scratch/saves/$world/backups"
+    ctl chat "/simplebackups status" >/dev/null
+    ctl wait 5 >/dev/null
+    local status players
+    status=$(newest_status_line) || fail "no status reply in the no-player scene"
+    echo "no-player status (before): $status"
+    players=$(sed -n 's/.*players=\([0-9][0-9]*\).*/\1/p' <<<"$status")
+    [ -n "$players" ] || fail "status did not report players=<n>: $status"
+    if [ "$players" -eq 0 ]; then
+        echo "harness: nobody is online — the genuinely playerless window is available"
+        if [ "$mode" = selftest ]; then
+            if wait_for_zip "$backups" 1; then
+                fail "NOPLAYER SELFTEST: an empty server made a backup ($(first_zip "$backups")) — the empty-window assertion is alive"
+            fi
+            fail "NOPLAYER SELFTEST inconclusive: the empty window produced no backup either way"
+        fi
+        if [ "$mode" = optin ]; then
+            wait_for_zip "$backups" 1 || fail "noPlayerBackups=true made no empty-server backup"
+            local first
+            first=$(first_zip "$backups")
+            echo "empty server with the opt-in: $first"
+            ctl wait 60
+            [ "$(count_zips "$backups")" -eq 1 ] || fail "the count=1 limit made a second empty-server backup"
+            [ "$(first_zip "$backups")" = "$first" ] || fail "the first empty-server backup was replaced"
+            echo "empty period: exactly one backup until a player joins"
+            check_zip "$first" "$world"
+        else
+            ctl wait 60
+            [ "$(count_zips "$backups")" -eq 0 ] || fail "an empty server made $(count_zips "$backups") backups with noPlayerBackups=false"
+            echo "empty window: no new archive across 60 ticks"
+            # A join is only meaningful if the harness can actually place a player.
+            ctl lan open 25570 true >/dev/null 2>&1 || true
+            ctl wait 10
+            ctl chat "/simplebackups status" >/dev/null
+            ctl wait 5 >/dev/null
+            local joined
+            joined=$(newest_status_line) || fail "no status reply after lan open"
+            echo "no-player status (after lan open): $joined"
+            if [[ "$joined" =~ players=0 ]]; then
+                echo "SKIP: lan open placed no player, so the join assertion cannot be made here"
+            else
+                wait_for_zip "$backups" 1 || fail "no backup after a player joined"
+                [ "$(count_zips "$backups")" -eq 1 ] || fail "expected exactly one archive after the join"
+                echo "player joined: exactly one archive: $(first_zip "$backups")"
+                check_zip "$(first_zip "$backups")" "$world"
+            fi
+        fi
+    else
+        echo "harness: the owner is online (players=$players); a genuinely playerless interval is not producible by ctl"
+        if [ "$mode" = selftest ]; then
+            if wait_for_zip "$backups" 1; then
+                fail "NOPLAYER SELFTEST: a scheduled backup appeared with a player online — the online-window assertion is alive (no empty window was available to invert)"
+            fi
+            fail "NOPLAYER SELFTEST inconclusive: no backup appeared with a player online either"
+        fi
+        wait_for_zip "$backups" 1 || fail "no scheduled backup with a player online under noPlayerBackups=$flag"
+        echo "online-window assertion: a scheduled backup appeared with players=$players"
+        check_zip "$(first_zip "$backups")" "$world"
+    fi
+    ctl chat "/simplebackups status" >/dev/null
+    ctl wait 5 >/dev/null
+    local after
+    after=$(newest_status_line) || fail "no final status reply in the no-player scene"
+    echo "no-player status (after): $after"
+    ctl quit >/dev/null 2>&1 || true
+    sleep 1
+    rm -rf "$scratch"
 }
 
 run_scenario() {
@@ -1150,6 +1264,17 @@ if [ "${SELFTEST:-0}" = "chain" ]; then
     run_chain_scenario SimpleBackupsChainSelf "${E2E_TMP:-/tmp/opencode}/simplebackups-chain-self.sock" chain
     fail "CHAIN SELFTEST inconclusive: the chain scene returned without its assertion"
 fi
+if [ "${SELFTEST:-0}" = "noplayer" ]; then
+    echo "== scenario L selftest: invert the assertion the harness can actually make =="
+    run_no_player_scenario SimpleBackupsNoPlayerSelf "${E2E_TMP:-/tmp/opencode}/simplebackups-noplayer-self.sock" selftest
+    fail "NOPLAYER SELFTEST inconclusive: the no-player scene returned without its assertion"
+fi
+if [ "${ONLY:-}" = "L" ]; then
+    echo "== scenario L alone (diagnostic): report the observed player count =="
+    run_no_player_scenario SimpleBackupsNoPlayerDiag "${E2E_TMP:-/tmp/opencode}/simplebackups-noplayer-diag.sock" default
+    echo "PASS: scenario L alone"
+    exit 0
+fi
 if [ "${ONLY:-}" = "J" ]; then
     echo "== scenario J alone (diagnostic) =="
     run_schedule_scenario SimpleBackupsScheduleDiag "${E2E_TMP:-/tmp/opencode}/simplebackups-j-diag.sock"
@@ -1207,6 +1332,10 @@ echo "== scenario J2: a fresh world waits the full interval =="
 run_fresh_schedule_scenario SimpleBackupsFresh "${E2E_TMP:-/tmp/opencode}/simplebackups-fresh.sock"
 echo "== scenario K: incremental chains (base + changed-only child, merge, fresh-world differential) =="
 run_chain_scenario SimpleBackupsChain "${E2E_TMP:-/tmp/opencode}/simplebackups-chain.sock"
+echo "== scenario L: empty-server policy (the assertion the harness can make) =="
+run_no_player_scenario SimpleBackupsNoPlayer "${E2E_TMP:-/tmp/opencode}/simplebackups-noplayer.sock" default
+echo "== scenario L2: the noPlayerBackups opt-in and its per-period count =="
+run_no_player_scenario SimpleBackupsNoPlayerOptIn "${E2E_TMP:-/tmp/opencode}/simplebackups-noplayer-optin.sock" optin
 # The control is opt-in (CONTROL=1 with CONTROL_GAME): the campaign's control leg is the same
 # e2e run with `GAME=$CONTROL_GAME`, and launching a second game here raced the first one's
 # socket and scratch.
@@ -1214,4 +1343,4 @@ if [ "${CONTROL:-0}" = 1 ]; then
     echo "== control: the unmodded game creates no backup =="
     run_control_scenario SimpleBackupsControl /tmp/opencode/simplebackups-e.sock
 fi
-echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); a manual export with the world's own shape survives until an operator adopts it and is pruned after (scenario G); a backup allocated in a second that already has generations becomes the highest suffix and survives keep and the cap (scenario H, H2); pause suppresses only the schedule and persists beside the world, a manual backup still works while paused, and unpause resumes with exactly one new zip named by list (scenario I); the tick counter resumes from the persisted state beside the world across quit and relaunch, while a fresh world with no state file waits the full interval (scenarios J, J2); an incremental chain's child names its full base and carries only the changed file, status reports chain=2 and list names both, merge folds the chain into one standalone archive, and a fresh world's first backup is full with chain=1 (scenario K)"
+echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); a manual export with the world's own shape survives until an operator adopts it and is pruned after (scenario G); a backup allocated in a second that already has generations becomes the highest suffix and survives keep and the cap (scenario H, H2); pause suppresses only the schedule and persists beside the world, a manual backup still works while paused, and unpause resumes with exactly one new zip named by list (scenario I); the tick counter resumes from the persisted state beside the world across quit and relaunch, while a fresh world with no state file waits the full interval (scenarios J, J2); an incremental chain's child names its full base and carries only the changed file, status reports chain=2 and list names both, merge folds the chain into one standalone archive, and a fresh world's first backup is full with chain=1 (scenario K); the empty-server policy's online branch still schedules with players online while status reports the observed player count and the persisted empty-period counter (scenarios L, L2)"

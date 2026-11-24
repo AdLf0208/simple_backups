@@ -27,10 +27,11 @@ use mod_api::{
 };
 
 use crate::runtime::{
-    ADOPTION_FILE, Adoption, Archive, MANIFEST_ENTRY, Settings, backup_file_name, cap_removals,
-    copy_is_stale, due_by_millis, due_by_ticks, entry_name, format_adoptions, format_size,
-    format_size_setting, is_adopted, manifest, manifest_identifies, parse, parse_adoptions,
-    parse_archive, prune, should_skip, to_toml,
+    ADOPTION_FILE, Adoption, Archive, MANIFEST_ENTRY, PAUSE_FILE, Settings, backup_file_name,
+    cap_removals, copy_is_stale, due_by_millis, due_by_ticks, entry_name, format_adoptions,
+    format_paused, format_size, format_size_setting, is_adopted, manifest, manifest_identifies,
+    parse, parse_adoptions, parse_archive, parse_paused, prune, schedule_allowed, should_skip,
+    to_toml,
 };
 use crate::zip::{ZipWriter, entry_names, read_entry};
 
@@ -106,6 +107,9 @@ struct Core {
     save_wait_ticks: u64,
     rx: Option<Receiver<Result<Copy, String>>>,
     closing: bool,
+    /// Loaded from `<world>/simplebackups-paused.txt` when the world opens. It suppresses only
+    /// scheduled backups; a manual request still queues (`shouldRunBackup` parity).
+    paused: bool,
     last_completed: Option<String>,
     last_error: Option<String>,
     /// The backup folder's size after the last publish.
@@ -222,6 +226,7 @@ fn ensure_world(host: &dyn ServerHost) {
     if core.world.as_deref() == Some(dir.as_path()) {
         return;
     }
+    core.paused = read_paused(&dir);
     core.world = Some(dir);
     core.ticks = 0;
     core.last_tick = 0;
@@ -396,7 +401,9 @@ pub fn on_server_tick(host: &mut dyn ServerHost, world_running: bool) {
             }
             return;
         }
-        let due = core.cfg.enabled
+        // Upstream's `shouldRunBackup` also refuses while paused. A queued manual request bypasses
+        // this gate entirely, exactly as upstream's `createBackup` bypasses `shouldRunBackup`.
+        let due = schedule_allowed(core.cfg.enabled, core.paused)
             && if core.cfg.interval_ticks > 0 {
                 due_by_ticks(core.last_tick, core.ticks, core.cfg.interval_ticks)
             } else {
@@ -701,6 +708,30 @@ fn write_adoptions(dir: &Path, adoptions: &[Adoption]) -> io::Result<()> {
     fs::rename(&staging, &path)
 }
 
+/// The persisted pause flag lives beside the world, not in its backup folder (which a user may
+/// delete without expecting to unpause the schedule).
+fn pause_path(world: &Path) -> PathBuf {
+    world.join(PAUSE_FILE)
+}
+
+/// Read the persisted flag when a world opens. Upstream loads `paused` from its `BackupData`
+/// `SavedData` at the same moment.
+fn read_paused(world: &Path) -> bool {
+    fs::read_to_string(pause_path(world))
+        .ok()
+        .and_then(|text| parse_paused(&text))
+        .unwrap_or(false)
+}
+
+/// Persist the flag with a staged rename, like the adoption journal, so a crash cannot leave a
+/// half-written boolean that parses as unpaused.
+fn write_paused(world: &Path, paused: bool) -> io::Result<()> {
+    let path = pause_path(world);
+    let staging = world.join(format!("{PAUSE_FILE}.tmp"));
+    fs::write(&staging, format_paused(paused))?;
+    fs::rename(&staging, &path)
+}
+
 /// An operator's `/simplebackups adopt <file>`: record a legacy archive (one written before the
 /// manifest existed) as this world's, so retention may delete it.
 ///
@@ -906,8 +937,39 @@ pub fn register_commands(commands: &mut Vec<Command>) {
     commands.push(Command::op("simplebackups backup [quiet:boolean]", 2));
     commands.push(Command::op("simplebackups status", 2));
     commands.push(Command::op("simplebackups list", 2));
+    // The two pause operations. Upstream spells them `/simplebackups backup pause|unpause`; the
+    // short `/simplebackups pause|unpause` alias is registered too, so either reads naturally.
+    commands.push(Command::op("simplebackups backup pause", 2));
+    commands.push(Command::op("simplebackups backup unpause", 2));
+    commands.push(Command::op("simplebackups pause", 2));
+    commands.push(Command::op("simplebackups unpause", 2));
     // An operator-level action: it is the *only* way a marker-less archive becomes deletable.
     commands.push(Command::op("simplebackups adopt <file:text>", 2));
+}
+
+/// Flip the persisted pause flag and report what is now in force. The flag is written to the
+/// world folder before the in-memory copy changes, so a refused write cannot leave the two
+/// disagreeing (and a restart reads the file again).
+fn set_paused(paused: bool) -> String {
+    let world = {
+        let guard = core();
+        guard.as_ref().and_then(|core| core.world.clone())
+    };
+    let Some(world) = world else {
+        return "Pause failed: no world is open.".to_owned();
+    };
+    if let Err(error) = write_paused(&world, paused) {
+        return format!("Pause failed: {error}");
+    }
+    let mut guard = core();
+    if let Some(core) = guard.as_mut() {
+        core.paused = paused;
+    }
+    if paused {
+        "Backups paused.".to_owned()
+    } else {
+        "Backups resumed.".to_owned()
+    }
 }
 
 /// The adopt command's body: the open world's backup folder and the file name an operator named.
@@ -954,6 +1016,14 @@ pub fn run_command(host: &mut dyn ServerHost, event: &RunModCommandEvent<'_>) ->
                 let _ = host.commands().feedback(Text::literal(line));
             }
         }
+        ["simplebackups", "pause"] | ["simplebackups", "backup", "pause"] => {
+            let reply = set_paused(true);
+            let _ = host.commands().feedback(Text::literal(reply));
+        }
+        ["simplebackups", "unpause"] | ["simplebackups", "backup", "unpause"] => {
+            let reply = set_paused(false);
+            let _ = host.commands().feedback(Text::literal(reply));
+        }
         ["simplebackups", "adopt"] => {
             let file = match event.command.argument("file") {
                 Some(mod_api::CommandArgumentValue::String(text)) => text.clone(),
@@ -997,9 +1067,10 @@ fn status_lines() -> Vec<String> {
         core.last_completed.as_deref().unwrap_or("-"),
         core.last_error.as_deref().unwrap_or("-")
     ));
+    // `paused` is appended so the earlier substring assertions (saves=/retries=/stale=) stay valid.
     lines.push(format!(
-        "saves={} retries={} stale={}",
-        core.save_seq, core.retries, core.stale
+        "saves={} retries={} stale={} paused={}",
+        core.save_seq, core.retries, core.stale, core.paused
     ));
     // The disk cap is a config key of its own, so it gets a line of its own: the folder's size after
     // the last publish, the cap it is measured against, and whether it is still over it. The
@@ -1085,6 +1156,23 @@ mod tests {
         if let Some(root) = world.parent() {
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn the_pause_flag_is_persisted_beside_the_world() {
+        let world = scratch_world("pause-flag");
+        assert!(
+            !read_paused(&world),
+            "a world that never paused starts unpaused"
+        );
+        write_paused(&world, true).expect("write the paused flag");
+        assert!(
+            read_paused(&world),
+            "the flag must survive being re-read from disk"
+        );
+        write_paused(&world, false).expect("clear the paused flag");
+        assert!(!read_paused(&world), "unpause must be persisted too");
+        cleanup(&world);
     }
 
     /// Settings with the two retention bounds a scene needs.

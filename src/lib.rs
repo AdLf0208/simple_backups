@@ -14,7 +14,8 @@
 //! - `world_lifecycle` / `server_stopping`: forget the world / stop scheduling.
 //! - `server_tick`: the end of a running tick polls the worker and starts a due or queued backup.
 //! - `world_saved`: a save cycle completed — count it, and start the copy that was waiting.
-//! - `register_commands` / `run_mod_command`: `/simplebackups backup|status|list` (level 2).
+//! - `register_commands` / `run_mod_command`: `/simplebackups backup|status|list|pause|unpause`
+//!   (level 2). `pause` suppresses only the schedule; a manual `backup` still runs.
 //!
 //! The jar carries no blocks, items, recipes, tags or models, so nothing is carried: the package
 //! has no `assets/` or `data/`.

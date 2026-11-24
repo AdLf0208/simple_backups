@@ -18,6 +18,10 @@ operator's `/simplebackups adopt <file>`, a new backup is allocated above the hi
 same-second suffix (and never deleted by the pass that follows), and a malformed name can no longer
 panic the server tick; 53 tests, scenarios G/H/H2 in game, and the pre-fix behaviour kept as
 `negative` legs.
+**0.2.5** (2026-11-24) is the pause/unpause slice: two level-2 commands flip a flag the tick
+already reads. The flag persists beside the world (upstream's `BackupData.paused`), pausing
+suppresses only the schedule, and a manual backup still works; 56 tests, scenario I green with a
+`SELFTEST=pause` inversion, and `Compiling simplebackups (1 of 1)` on the launcher build.
 
 **Class + tier** (from `ports/ledger.csv`, per `horizon/docs/modpacks.md`):
 **server-only / logic**. The approach is the **logic shape**: a pure policy
@@ -212,7 +216,7 @@ phase that asserts it.
 | malformed archive name | tested | `runtime::tests::a_name_with_a_multibyte_character_at_the_stamp_boundary_is_refused`: a two-byte character at byte 19 is refused, not sliced (the pre-fix `split_at(19)` panicked) |
 | commands `backup` / `status` / `list` / `adopt` | tested | `ctl chat "/simplebackups backup"` and `status` in every scenario, `list` in scenario D: the reply names every archive in the folder, and after a `1 B` cap it no longer names the deleted one; `adopt` in scenario G (confirmed reply, `adopted=1`, and a refusal for a name that is not this world's) |
 | save-overlap retry (`retry_on_save`) | tested | unit test `should_retry`; scenario F forces a real overlap with `ctl save` during a 256 MiB copy (`stale=true`, `saves=6`); scenario C's pause/resume still prints `SKIP` (that path cannot make a save) |
-| `pause` / `unpause` | not ported | gap (commands are `backup`, `status`, `list` only) |
+| `pause` / `unpause` | tested | scenario I: `interval_ticks=40`, a first zip (differential), `/simplebackups pause` → 150 ticks with no new zip and `status` `paused=true` (the `saves=` line, not the whole chat buffer), the persisted flag file read back, a manual `backup` while paused → a fresh zip, `/simplebackups backup unpause` → `paused=false` and exactly one new zip named by `list`; `SELFTEST=pause` (`EXIT:1`) proves the paused-window assertion can fail. The pure rules are `runtime::tests::a_paused_schedule_never_starts_a_backup` and `the_pause_flag_round_trips_through_its_file`, the file round-trip `support::tests::the_pause_flag_is_persisted_beside_the_world` |
 | empty-server policy (`noPlayerBackups`) | not ported | gap; needs a player-presence API and a way to empty the server headless |
 | `latest.log` → `backup.log` | not ported | gap (needs a path outside the world folder) |
 | disk reservation before a copy | not ported | gap (upstream's `NotEnoughDiskSpaceException`) |
@@ -507,6 +511,134 @@ Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven
 > scenarios G, H and H2 are green, and the 0.2.3 package fails both (the `negative` legs).
 > Package 50,023 B, sha256 `f7a25eae…`.
 
+## Slice 5 (0.2.5, 2026-11-24) — `pause` / `unpause`
+
+**Gap line.** The coverage table above: *"`pause` / `unpause` | not ported | gap (commands are
+`backup`, `status`, `list` only)"*, and *Gaps after the migration* item 4. It fits **server-only /
+logic**: two level-2 commands flip a boolean the tick already evaluates; no new hook, block entity,
+menu, renderer or carried content. The jar has `commands/PauseCommand` and `network/Pause`.
+`horizon/docs/modpacks.md` puts "backups" in the server-only class and "server events, typed
+commands" in the logic tier, so this is the same shape as the existing command work.
+
+**Upstream source (read again for this slice).** The checkout removed after the first analysis was
+re-cloned read-only to `ports/_shared/upstream/simplebackups-src` at branch `1.21.1`, head
+**`bf04de3e7b3e05504ee5cc974cf45833b0d4b9a4`** (the pack's `1.21-4.0.30` source), from
+<https://github.com/ChaoticTrials/SimpleBackups>. Files read: `commands/PauseCommand.java`,
+`commands/BackupCommand.java`, `BackupData.java`, `BackupThread.java:80-139`,
+`network/Pause.java`, `client/ClientEventHandler.java`,
+`src/main/resources/assets/simplebackups/lang/en_us.json`. The clone was deleted after these
+findings were recorded.
+
+**The pause flag's persistence rule, as read from the jar's source:**
+`PauseCommand.java:20-26` registers `backup pause|unpause`; its `run` does
+`BackupData.get(server).setPaused(this.paused)` (`:31-32`) and sends a `Pause` packet to all players.
+`BackupData` is a `SavedData` held under the key `"simplebackups"` on the overworld's data storage
+(`:36-42`); `paused` is written as the NBT boolean `"paused"` in `save` (`:29`) and read in `load`
+(`:47`), and `setPaused` calls `setDirty()` (`:54-57`) — so **the flag persists across server
+restarts**, loaded with the world's saved data. Only `shouldRunBackup` consults it
+(`BackupThread.java:103-107`: `!isEnabled() || … || backupData.isPaused()`), so pausing suppresses
+**scheduled** backups. The manual path is independent: `BackupCommand.java:34` calls
+`BackupThread.createBackup`, which (`:126-129`) starts a thread with **no `paused` check**, so a
+manual backup still runs while paused. `network/Pause.java` only drives a client-side red
+"Backups paused" HUD string (`ClientEventHandler.java:14-37`; `en_us.json:7`); that is a `client`
+half and is deliberately not ported.
+
+**Port decisions.** `runtime.rs` gains the pure `schedule_allowed(enabled, paused)`,
+`format_paused` and `parse_paused`; `PAUSE_FILE = "simplebackups-paused.txt"` lives beside the
+world (not in the deletable backup folder), is read by `ensure_world` when the world opens (the
+`SavedData` load moment) and written with a staged rename. `Core.paused` is appended to the
+`saves=` status line. Semantics are otherwise upstream's: only the `due` gate consults the flag,
+so a queued manual request still queues. Both upstream's `/simplebackups backup pause|unpause`
+and the short `/simplebackups pause|unpause` are registered at level 2; feedback is "Backups
+paused." / "Backups resumed.". A malformed or absent flag file means unpaused.
+
+**Red → green.** Three failing tests first, against stubs that ignored the flag (`sdk-test-red-pause.log`):
+
+```
+---- runtime::tests::a_paused_schedule_never_starts_a_backup stdout ----
+thread 'runtime::tests::a_paused_schedule_never_starts_a_backup' (29348) panicked at src/runtime.rs:781:9:
+pausing suppresses only the schedule
+
+---- runtime::tests::the_pause_flag_round_trips_through_its_file stdout ----
+thread 'runtime::tests::the_pause_flag_round_trips_through_its_file' (29376) panicked at src/runtime.rs:788:9:
+assertion `left == right` failed
+  left: Some(false)
+ right: Some(true)
+
+---- support::tests::the_pause_flag_is_persisted_beside_the_world stdout ----
+thread 'support::tests::the_pause_flag_is_persisted_beside_the_world' (29387) panicked at src/support.rs:1115:9:
+the flag must survive being re-read from disk
+
+test result: FAILED. 53 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+```
+
+Green: **56 passed, 0 failed** (34 `runtime`, 11 `support`, 11 `zip`), clippy `-D warnings` 0
+warnings, `fmt --check` clean — `sdk-test.log`, `sdk-clippy.log`, `sdk-fmt.log`.
+
+**In game.** Launcher build `native-0a875da-15bed05fb2e0`, `Compiling simplebackups (1 of 1)`,
+every packed source byte-identical to this tree (`../_shared/evidence/simplebackups-e2e/build-record.txt`).
+Scenario I (the `list` and `status` assertions parse only the **newest** chat line — a grep over
+the 20-message buffer matched a stale `last=<old archive>` and produced a false failure on the
+first run, now fixed):
+
+```
+before pause: …/SimpleBackupsPause_2026-11-24_01-42-19.zip
+paused line: saves=0 retries=0 stale=false paused=true
+paused window: no new backup across 150 ticks
+manual backup while paused: …/SimpleBackupsPause_2026-11-24_01-42-29.zip
+paused line: saves=0 retries=0 stale=false paused=false
+resumed backup: …/SimpleBackupsPause_2026-11-24_01-42-40.zip
+list: SimpleBackupsPause_2026-11-24_01-42-40.zip (9.8 MB)
+PASS: … pause suppresses only the schedule and persists beside the world, a manual backup still works while paused, and unpause resumes with exactly one new zip named by list (scenario I) …
+EXIT:0
+```
+
+`SELFTEST=pause` inverts the paused-window assertion and ends
+`FAIL: PAUSE SELFTEST: no new zip appeared during 150 paused ticks (the 40-tick interval would have made ~3) — the assertion is alive` + `EXIT:1`.
+Control `EXIT:1`, `SELFTEST=1` `EXIT:1`, `STALE_SELFTEST=1` `EXIT:1`, `ADOPT_NEGATIVE=1` `EXIT:1`,
+`SAME_SECOND_NEGATIVE=1` `EXIT:1`; `check-e2e-logs.py simplebackups-e2e --strict` →
+`logs=7 ok=7 missing-exit=0 bad-exit=0`. The two older negative legs re-run on the 0.2.5 game exit
+1 through the inconclusive guard because those fixes are present; their live differential against
+0.2.3 is preserved in `build-record-0.2.3.txt` and the 0.2.4 notes.
+
+**Remote build path.** Every cargo ladder step forwarded through
+`ports/tools/build-slot.sh run --job G10-simplebackups --port ports/simplebackups --step …`,
+printing `build-slot: forwarding … to the remote runner` on host **AdLf-PC** (`test`, `lint`,
+`fmt`, `build` ×2, `check`, `fits` ×2). `BUILD_LOCAL=1` was never set. The launcher native build and
+its seven game legs stayed local: the second box has the repaired SDK CLI and the 26.3 resources
+but **no `horizon-launcher` and no Nightly versions cache** (checked over ssh), so a forwarded
+game leg cannot build or launch. The launcher build was still run inside a slot lease with
+`FORWARDED=1` (keep-local marker, not `BUILD_LOCAL`), producing the `Compiling simplebackups (1 of 1)` line above.
+
+### Package 0.2.5
+
+| | |
+|---|---|
+| version | **0.2.5** (`horizon-mod.toml` + `Cargo.toml`) |
+| bytes | **51,968 B** |
+| sha256 | `13fb3e0a397b1ecd8232ed338f1dc986c82770f6bc09055cedf7fca714b0e16b` |
+| entries | **10** — `horizon-mod.toml`, `Cargo.toml`, `LICENSE`, `LICENSE-NOTICE.md`, `README.md`, `src/{lib,runtime,support,zip}.rs`, `uses.json`; **no `Cargo.lock`** |
+| reproducible | two builds, each after `rm -f Cargo.lock`: identical sha and `cmp` |
+| `check` | `simplebackups 0.2.5 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, 51,968 bytes, exit 0 |
+| `fits --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `0a875da  made for` (the pin tautology) |
+| `fits --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `0b14f8a  fits` — the real gate |
+| tests | **56 passed, 0 failed** |
+| `verify-sdk-package.py simplebackups` | `1/1`, `package matches the tree` |
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices
+
+### Changelog (0.2.5)
+
+> **0.2.5 — pause/unpause, persisted beside the world.** `/simplebackups pause|unpause` (also
+> `/simplebackups backup pause|unpause`, upstream's spelling) flips a flag the tick already reads,
+> so pausing suppresses **only** the schedule — a manual `backup` still runs, as upstream's
+> `createBackup` bypasses `shouldRunBackup`. The flag is stored in `simplebackups-paused.txt` beside
+> the world and reloaded when it opens, mirroring upstream's `paused` boolean in its `BackupData`
+> `SavedData` (which survives restarts). `/simplebackups status` reports `paused=<bool>`. The
+> client-side red HUD banner from the jar's `Pause` packet is not ported (a client/UI half).
+> 56 tests; scenario I proves the paused window, the manual backup while paused and the resumed
+> archive, and `SELFTEST=pause` proves that assertion can fail. 51,968 B, sha256 `13fb3e0a…`.
+
 ## Verification (re-pin `83ad384f`, 2026-11-06/07)
 
 
@@ -561,9 +693,10 @@ works while disabled`.
   upstream mod has the same race; `save_game()` flushes, which is better than
   upstream). A synchronous copy or a future save-off hook would close it.
 - The schedule is not persisted across restarts; it starts at world open.
-  Empty-server policy, disk cap, pause/unpause, `latest.log` capture,
-  incremental/chains/merge, Cherished Worlds/mc2discord and regex ignores are
-  deferred.
+  Empty-server policy, `latest.log` capture, incremental/chains/merge, Cherished
+  Worlds/mc2discord and regex ignores are deferred. The disk cap (slice 2) and
+  `pause`/`unpause` (slice 5) are now ported; the pause **flag** persists, the
+  schedule counter still does not.
 - Retention prunes after success (upstream deletes before creating), only archives the port can
   identify as its own (a manifest since 0.2.3; a marker-less 0.2.0–0.2.2 archive only after an
   operator's `/simplebackups adopt <file>`), and after a stale copy it prunes nothing at all; all
@@ -629,9 +762,9 @@ works while disabled`.
   path after its world closed. Trust it only between `WorldOpenReady` and
   `WorldCloseFinal`; do not read it in `server_about_to_start`.
   `native_config_dir()` is static and safe anywhere.
-- **Deferred:** incremental/chains/merge, pause/unpause, `latest.log`
-  capture, disk-size cap, empty-server policy, Cherished Worlds, mc2discord,
-  regex ignores, persisted schedule, sync-copy mode.
+- **Deferred (as of the 2026-11-03 analysis; pause and the disk cap were later ported — slices 5
+  and 2):** incremental/chains/merge, `latest.log` capture, empty-server policy, Cherished Worlds,
+  mc2discord, regex ignores, persisted schedule, sync-copy mode.
 - **Licence:** Apache-2.0 permits derivatives, but the port stays local-only
   until the maintainer approves publishing (ARCHITECTURE.md §8). The scaffold's
   `Cargo.toml` currently declares `MIT` while upstream is Apache-2.0; the
@@ -802,9 +935,10 @@ remote runner. Evidence in `../_shared/evidence/simplebackups/`.
    pinned compressor crate (or ships a `deflate` helper) closes it.
 3. **The 0.1.0 harness logs are gone** (`target/horizon-test.log`, `target/G9-e2e.log` lived in
    `target/`, which the disk-hygiene rule cleans); the transcript quoted in this file is the record.
-4. Still deferred, unchanged: incremental/chains/merge, pause/unpause, `latest.log` capture, the
-   empty-server policy, Cherished Worlds/mc2discord, regex ignores and a persisted schedule
-   (**the disk cap is now done — see *Slice 2 (0.2.2)*, which also adds `max_disk_size`**).
+4. Still deferred, unchanged: incremental/chains/merge, `latest.log` capture, the empty-server
+   policy, Cherished Worlds/mc2discord, regex ignores and a persisted schedule counter (**the disk
+   cap is done — *Slice 2 (0.2.2)* — and pause/unpause is done — *Slice 5 (0.2.5)*; the pause flag
+   persists but the schedule interval still restarts at world open**).
 5. `/simplebackups status` is the only route for a config warning; there is no log file.
 6. `side = "both"`, so the mod is installed on a client too; that is required for single player and
    a LAN host (their integrated server belongs to the client installation).

@@ -235,6 +235,33 @@ pub fn due_by_millis(last_ms: u64, now_ms: u64, interval_minutes: u64) -> bool {
         && now_ms.saturating_sub(last_ms) >= interval_minutes.saturating_mul(60_000)
 }
 
+/// The persisted pause flag, stored beside the world. Upstream keeps `paused` in its
+/// `BackupData` `SavedData` (NBT boolean `paused`, `setDirty()` on change); a native mod has no
+/// SavedData API, so the same bit lives in this file and is read when the world opens.
+pub const PAUSE_FILE: &str = "simplebackups-paused.txt";
+
+/// Whether the **schedule** may start a backup. Upstream's `shouldRunBackup` returns false while
+/// paused; a manual `backup` command calls `createBackup` directly and ignores both `enabled`
+/// and `paused`.
+pub fn schedule_allowed(enabled: bool, paused: bool) -> bool {
+    enabled && !paused
+}
+
+/// The one line this port writes for the persisted flag.
+pub fn format_paused(paused: bool) -> String {
+    format!("paused = {paused}\n")
+}
+
+/// Read the persisted flag. Only an exact line this port writes counts as paused: an absent,
+/// malformed or hand-edited file leaves the schedule running.
+pub fn parse_paused(text: &str) -> Option<bool> {
+    match text.trim() {
+        "paused = true" => Some(true),
+        "paused = false" => Some(false),
+        _ => None,
+    }
+}
+
 /// Whether a copy that started at `start_seq` overlapped a save: the world's
 /// save notification counter moved while the zip was being written, so a
 /// region file may be half-replaced inside it. Such a copy is thrown away and
@@ -750,6 +777,38 @@ mod tests {
         assert!(!due_by_millis(0, 7_199_999, 120));
         assert!(due_by_millis(0, 7_200_000, 120));
         assert!(!due_by_millis(0, 7_200_000, 0));
+    }
+
+    #[test]
+    fn a_paused_schedule_never_starts_a_backup() {
+        assert!(
+            schedule_allowed(true, false),
+            "an enabled, unpaused schedule runs"
+        );
+        assert!(
+            !schedule_allowed(true, true),
+            "pausing suppresses only the schedule"
+        );
+        assert!(
+            !schedule_allowed(false, false),
+            "enabled=false still gates it"
+        );
+        assert!(
+            !schedule_allowed(false, true),
+            "both gates together stay shut"
+        );
+    }
+
+    #[test]
+    fn the_pause_flag_round_trips_through_its_file() {
+        assert_eq!(parse_paused(&format_paused(true)), Some(true));
+        assert_eq!(parse_paused(&format_paused(false)), Some(false));
+        assert_eq!(parse_paused(""), None, "a missing flag file means unpaused");
+        assert_eq!(
+            parse_paused("paused = yes\n"),
+            None,
+            "a malformed flag is refused"
+        );
     }
 
     #[test]

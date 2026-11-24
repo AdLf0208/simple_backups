@@ -38,9 +38,18 @@ the game glue and `src/zip.rs` the archive writer. The launcher compiles it agai
   then skipped**, so the previous confirmed restore point is never deleted in favour of a copy a
   save may have caught half-written (the folder may stay over the cap until the next good backup).
 - **Commands** (level 2): `/simplebackups backup [quiet]`, `/simplebackups status`,
-  `/simplebackups list`, `/simplebackups adopt <file>`. A manual backup ignores `enabled`. `adopt`
-  records a marker-less archive (by name and size, in `simplebackups-adopted.txt` in the backup
-  folder) as this world's, which is the only way it becomes deletable.
+  `/simplebackups list`, `/simplebackups adopt <file>`, and the pause pair
+  `/simplebackups pause` / `/simplebackups unpause` (also accepted as
+  `/simplebackups backup pause|unpause`, upstream's spelling). A manual backup ignores both
+  `enabled` and `paused`. `adopt` records a marker-less archive (by name and size, in
+  `simplebackups-adopted.txt` in the backup folder) as this world's, which is the only way it
+  becomes deletable.
+- **Pause:** `pause` suppresses only the schedule, exactly like upstream's `shouldRunBackup`
+  checking `BackupData.isPaused()`; a manual `backup` still runs. The flag is persisted in
+  `simplebackups-paused.txt` beside the world and reloaded when the world opens, mirroring
+  upstream's `paused` field in its `BackupData` SavedData. `/simplebackups status` reports
+  `paused=<bool>`. The client-side red HUD banner the jar sends over its `Pause` packet is not
+  ported (a `client`/UI half, outside this server-only logic port).
 - **Config** `config/simplebackups.toml`: `enabled`, `interval_minutes`, `interval_ticks`, `keep`,
   `max_disk_size`, `compression_level`, `save_before_backup`, `retry_on_save`, `broadcast`,
   `backups_dir`, `ignored_paths`, `ignored_files`. A missing file is written with the defaults.

@@ -38,6 +38,13 @@
 #   and `keep`/the cap must never delete the archive just written.
 #   ADOPT_NEGATIVE=1 / SAME_SECOND_NEGATIVE=1 run one scene alone against a package that
 #   should fail it (the previous version), and exit non-zero either way.
+# Scenario I: the persisted pause pair. `interval_ticks=40`, keep=1. The schedule first makes a
+#   zip (the differential, scenario A); `/simplebackups pause` then 150 ticks must make no *new*
+#   zip while `status` says paused=true and the flag file beside the world says so. A manual
+#   `backup` must still work while paused (upstream's createBackup ignores `paused`), and
+#   `/simplebackups unpause` then ≤100 ticks must produce exactly one new zip, named by `list`.
+#   SELFTEST=pause runs the same scene and FAILS when no new zip appears during the paused window,
+#   so the "no zip while paused" assertion is proved able to fail; it always exits non-zero.
 #
 # Since the SDK migration (2026-11-18) the mod is a flat `.hmod` the launcher
 # compiles into the game, so GAME must name a game the launcher built with it:
@@ -48,7 +55,8 @@
 #
 # SELFTEST=1 inverts scenario A's assertion — it waits for the scheduled zip and
 # FAILS when one appears, which proves the assertion is not vacuous. It always
-# exits non-zero.
+# exits non-zero. SELFTEST=pause does the same for scenario I's paused window:
+# it FAILS when no new zip appeared during the 150 paused ticks.
 #
 # CONTROL_GAME=<unmodded horizon-client> adds the control leg: the same world
 # folder, 100 ticks, and no `<world>/backups` is created. The shared unmodded
@@ -636,6 +644,98 @@ run_same_second_scenario() { # world sock keep cap
     rm -rf "$scratch"
 }
 
+# Scenario I: pause/unpause. The 40-tick schedule makes a zip before the pause (the differential,
+# scenario A); a 150-tick paused window must not make another while status and the persisted flag
+# both say paused; a manual backup still works while paused; unpause makes exactly one new zip and
+# `list` names it. SELFTEST=pause inverts the paused-window assertion and exits non-zero.
+run_pause_scenario() {
+    local world=$1 sock=$2
+    local scratch
+    scratch=$(mktemp -d "${E2E_TMP:-/tmp/opencode}/simplebackups-pause.XXXXXX")
+    write_config "${CONFIG_DIR:-$scratch/config}" true true
+    launch "$sock" "$scratch" "$GAME" "$world"
+    local ctl
+    ctl() { "$CTL" --socket "$sock" "$@"; }
+    ctl wait-ready 120
+    ctl wait 10
+    local world_dir="$scratch/saves/$world"
+    local backups="$world_dir/backups"
+
+    # Differential: the same unpaused scene makes a zip in the first window (scenario A).
+    wait_for_zip "$backups" 1 || fail "no scheduled backup before pausing"
+    local before
+    before=$(first_zip "$backups")
+    echo "before pause: $before"
+    check_zip "$before" "$world"
+
+    # The short spelling is this port's assertion; the nested one is upstream's.
+    # `ctl messages` is newest-first, so `grep -m1` takes this status line, not a
+    # stale one still in the 20-message buffer (the last-N-lines false-proof trap).
+    ctl chat "/simplebackups pause"
+    ctl wait 5
+    local status status_line
+    status=$(status_text)
+    status_line=$(ctl messages 20 | jq -r '.chat[]' | grep -m1 'saves=')
+    echo "status after pause: $status"
+    echo "paused line: $status_line"
+    grep -q 'paused=true' <<<"$status_line" || fail "pause did not report paused=true: $status_line"
+    [ -f "$world_dir/simplebackups-paused.txt" ] \
+        || fail "the pause flag was not persisted beside the world"
+    grep -q 'paused = true' "$world_dir/simplebackups-paused.txt" \
+        || fail "the persisted pause flag has the wrong value"
+
+    # 150 ticks at a 40-tick interval would make ~3 backups; paused, none may appear.
+    ctl wait 150
+    local during
+    during=$(first_zip "$backups")
+    if [ "$during" != "$before" ]; then
+        fail "a scheduled backup appeared while paused: $during"
+    fi
+    if [ "${SELFTEST:-0}" = "pause" ]; then
+        fail "PAUSE SELFTEST: no new zip appeared during 150 paused ticks (the 40-tick interval would have made ~3) — the assertion is alive"
+    fi
+    echo "paused window: no new backup across 150 ticks"
+
+    # Upstream's manual `createBackup` ignores `paused`; so does this port's queued request.
+    ctl chat "/simplebackups backup"
+    wait_for_new_zip "$backups" "$before" || fail "a manual backup did not run while paused"
+    local manual
+    manual=$(first_zip "$backups")
+    check_zip "$manual" "$world"
+    echo "manual backup while paused: $manual"
+
+    # Upstream's nested spelling unpauses; the schedule must make exactly one fresh zip.
+    ctl chat "/simplebackups backup unpause"
+    ctl wait 5
+    status=$(status_text)
+    status_line=$(ctl messages 20 | jq -r '.chat[]' | grep -m1 'saves=')
+    echo "status after unpause: $status"
+    echo "paused line: $status_line"
+    grep -q 'paused=false' <<<"$status_line" || fail "unpause did not report paused=false: $status_line"
+    grep -q 'paused = false' "$world_dir/simplebackups-paused.txt" \
+        || fail "the cleared pause flag was not persisted"
+    wait_for_new_zip "$backups" "$manual" || fail "no scheduled backup within 100 ticks of unpause"
+    local resumed
+    resumed=$(first_zip "$backups")
+    [ "$(count_zips "$backups")" -eq 1 ] || fail "unpause left $(count_zips "$backups") archives, not exactly one"
+    check_zip "$resumed" "$world"
+    echo "resumed backup: $resumed"
+
+    # Same trap: take only the newest actual `list` line (an archive is printed as
+    # "name (size)"), never the older `last=<name>` fragments in the chat buffer.
+    local listing
+    listing=$(ctl chat "/simplebackups list" >/dev/null; ctl wait 5 >/dev/null; \
+        ctl messages 20 | jq -r '.chat[]' | grep -m1 '\.zip (')
+    echo "list: $listing"
+    grep -qF "$(basename "$resumed")" <<<"$listing" || fail "list does not name the resumed archive: $listing"
+    if grep -qF "$(basename "$manual")" <<<"$listing"; then
+        fail "list still names the pruned archive: $listing"
+    fi
+
+    ctl quit >/dev/null 2>&1 || true
+    sleep 1
+    rm -rf "$scratch"
+}
 
 # The control leg: the same scene on a game without the mod creates no backup at
 # all, so "a zip appeared" is the mod's doing and not the engine's.
@@ -658,6 +758,11 @@ run_control_scenario() {
     rm -rf "$scratch"
 }
 
+if [ "${SELFTEST:-0}" = "pause" ]; then
+    echo "== scenario I selftest: invert the pause flag's effect =="
+    run_pause_scenario SimpleBackupsPauseSelf /tmp/opencode/simplebackups-pause-self.sock
+    fail "PAUSE SELFTEST inconclusive: the pause scene returned without its assertion"
+fi
 if [ "${STALE_SELFTEST:-0}" = 1 ]; then
     echo "== scenario F selftest: assert retention did NOT skip after a stale copy =="
     run_stale_retention_scenario SimpleBackupsStaleSelf /tmp/opencode/simplebackups-stale-self.sock
@@ -695,6 +800,8 @@ echo "== scenario H: two archives of the same second, allocated above the highes
 run_same_second_scenario SimpleBackupsSameSecond /tmp/opencode/simplebackups-k.sock 2 "1 TB"
 echo "== scenario H2: the cap never deletes the archive just written =="
 run_same_second_scenario SimpleBackupsSameSecondCap /tmp/opencode/simplebackups-l.sock 3 "1 B"
+echo "== scenario I: pause suppresses the schedule, manual still runs, unpause resumes =="
+run_pause_scenario SimpleBackupsPause /tmp/opencode/simplebackups-m.sock
 # The control is opt-in (CONTROL=1 with CONTROL_GAME): the campaign's control leg is the same
 # e2e run with `GAME=$CONTROL_GAME`, and launching a second game here raced the first one's
 # socket and scratch.
@@ -702,4 +809,4 @@ if [ "${CONTROL:-0}" = 1 ]; then
     echo "== control: the unmodded game creates no backup =="
     run_control_scenario SimpleBackupsControl /tmp/opencode/simplebackups-e.sock
 fi
-echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); a manual export with the world's own shape survives until an operator adopts it and is pruned after (scenario G); a backup allocated in a second that already has generations becomes the highest suffix and survives keep and the cap (scenario H, H2); an archive carries its own manifest identity"
+echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); a manual export with the world's own shape survives until an operator adopts it and is pruned after (scenario G); a backup allocated in a second that already has generations becomes the highest suffix and survives keep and the cap (scenario H, H2); pause suppresses only the schedule and persists beside the world, a manual backup still works while paused, and unpause resumes with exactly one new zip named by list (scenario I); an archive carries its own manifest identity"

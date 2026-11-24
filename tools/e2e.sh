@@ -72,6 +72,12 @@
 # limit is recorded rather than dressing a chat command up as an empty server. SELFTEST=noplayer
 # inverts whichever assertion was actually made.
 #
+# Scenario N: the empty-server interval (noPlayerBackupTimer). A `ctl launch` always places its
+# owner (players=1), so a genuinely playerless interval is not producible: the status field
+# `timers=<configured>` is asserted from the NEWEST chat line, while both empty_period_interval
+# branches (0 -> main, explicit timer) are proved red-first by unit tests and reported as unit-only.
+# SELFTEST=noplayertimer inverts that one parsed value and exits non-zero.
+#
 # Scenario J2 (differential): a FRESH scratch world has no state file, so its interval starts at
 #   world open (scenario J's seeded counter makes one come 10 ticks sooner). It must wait a full
 #   interval from its own start; the empty window is sized from the ticks it actually reports,
@@ -373,6 +379,61 @@ EOF
 # decides which assertion can honestly be made: with nobody online the empty window is
 # asserted, otherwise the online branch is asserted and the harness limit is recorded.
 # `selftest` inverts whichever assertion was actually available.
+# Scenario N config: the empty-server interval. `no_player_backup_timer` is
+# upstream's noPlayerBackupTimer (minutes, default 0 = main interval). The scene
+# only reads status, so enabled=false keeps it short and deterministic.
+write_no_player_timer_config() { # config-dir timer
+    local dir=$1 timer=$2
+    mkdir -p "$dir"
+    cat > "$dir/simplebackups.toml" <<EOF
+enabled = false
+interval_minutes = 0
+interval_ticks = 40
+keep = 3
+compression_level = 1
+save_before_backup = false
+retry_on_save = true
+broadcast = false
+backups_dir = "backups"
+max_disk_size = "25 GB"
+no_player_backups = true
+no_player_backup_count = 1
+no_player_backup_timer = $timer
+EOF
+}
+
+run_no_player_timer_scenario() { # world sock mode
+    local world=$1 sock=$2 mode=${3:-on}
+    local scratch
+    scratch=$(mktemp -d "${E2E_TMP:-/tmp/opencode}/simplebackups-notimer.XXXXXX")
+    local timer=7
+    write_no_player_timer_config "${CONFIG_DIR:-$scratch/config}" "$timer"
+    launch "$sock" "$scratch" "$GAME" "$world"
+    local ctl
+    ctl() { "$CTL" --socket "$sock" "$@"; }
+    ctl wait-ready 120
+    ctl wait 10
+    ctl chat "/simplebackups status" >/dev/null
+    local status reported players
+    status=$(newest_status_line) || fail "no status reply in the no-player-timer scene"
+    echo "no-player-timer status (newest): $status"
+    reported=$(sed -n 's/.*timers=\([0-9][0-9]*\).*/\1/p' <<<"$status")
+    if [ "$mode" = selftest ]; then
+        if [ "$reported" = "$timer" ]; then
+            fail "NOPLAYERTIMER SELFTEST: the newest status line reported timers=$timer — the assertion is alive"
+        fi
+        fail "NOPLAYERTIMER SELFTEST inconclusive: no timers=$timer in the newest status line"
+    fi
+    [ -n "$reported" ] || fail "status did not report timers=<n>: $status"
+    [ "$reported" = "$timer" ] || fail "status reported timers=$reported, not the configured $timer: $status"
+    players=$(sed -n 's/.*players=\([0-9][0-9]*\).*/\1/p' <<<"$status")
+    echo "parsed newest status line: timers=$reported (configured no_player_backup_timer=$timer)"
+    echo "harness: players=${players:-?}; a genuinely playerless interval is not producible by ctl — both empty_period_interval branches are proved red-first by unit tests, not dressed up as a chat command"
+    ctl quit >/dev/null 2>&1 || true
+    sleep 1
+    rm -rf "$scratch"
+}
+
 run_no_player_scenario() { # world sock mode
     local world=$1 sock=$2 mode=$3
     local scratch
@@ -1365,6 +1426,11 @@ if [ "${SELFTEST:-0}" = "latestlog" ]; then
     run_game_log_scenario SimpleBackupsGameLogSelf "${E2E_TMP:-/tmp/opencode}/simplebackups-gamelog-self.sock" selftest
     fail "GAMELOG SELFTEST inconclusive: the log scene returned without its assertion"
 fi
+if [ "${SELFTEST:-0}" = "noplayertimer" ]; then
+    echo "== scenario N selftest: invert the parsed timers=<configured> assertion =="
+    run_no_player_timer_scenario SimpleBackupsNoPlayerTimerSelf "${E2E_TMP:-/tmp/opencode}/simplebackups-noplayertimer-self.sock" selftest
+    fail "NOPLAYERTIMER SELFTEST inconclusive: the no-player-timer scene returned without its assertion"
+fi
 if [ "${ONLY:-}" = "M" ]; then
     echo "== scenario M alone (diagnostic) =="
     run_game_log_scenario SimpleBackupsGameLogDiag "${E2E_TMP:-/tmp/opencode}/simplebackups-gamelog-diag.sock" on
@@ -1393,6 +1459,12 @@ if [ "${ONLY:-}" = "K" ]; then
     echo "== scenario K alone (diagnostic) =="
     run_chain_scenario SimpleBackupsChainDiag "${E2E_TMP:-/tmp/opencode}/simplebackups-k-diag.sock"
     echo "PASS: scenario K alone"
+    exit 0
+fi
+if [ "${ONLY:-}" = "N" ]; then
+    echo "== scenario N alone (diagnostic): report the parsed timers value =="
+    run_no_player_timer_scenario SimpleBackupsNoPlayerTimerDiag "${E2E_TMP:-/tmp/opencode}/simplebackups-noplayertimer-diag.sock" on
+    echo "PASS: scenario N alone"
     exit 0
 fi
 if [ "${STALE_SELFTEST:-0}" = 1 ]; then
@@ -1448,6 +1520,8 @@ echo "== scenario M: the scratch latest.log is captured as a flat backup.log =="
 run_game_log_scenario SimpleBackupsGameLog "${E2E_TMP:-/tmp/opencode}/simplebackups-gamelog.sock" on
 echo "== scenario M counterfactual: capture_latest_log=false packs no backup.log =="
 run_game_log_scenario SimpleBackupsGameLogOff "${E2E_TMP:-/tmp/opencode}/simplebackups-gamelog-off.sock" off
+echo "== scenario N: the parsed newest status line reports the configured no_player_backup_timer =="
+run_no_player_timer_scenario SimpleBackupsNoPlayerTimer "${E2E_TMP:-/tmp/opencode}/simplebackups-noplayertimer.sock" on
 # The control is opt-in (CONTROL=1 with CONTROL_GAME): the campaign's control leg is the same
 # e2e run with `GAME=$CONTROL_GAME`, and launching a second game here raced the first one's
 # socket and scratch.
@@ -1455,4 +1529,4 @@ if [ "${CONTROL:-0}" = 1 ]; then
     echo "== control: the unmodded game creates no backup =="
     run_control_scenario SimpleBackupsControl /tmp/opencode/simplebackups-e.sock
 fi
-echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); a manual export with the world's own shape survives until an operator adopts it and is pruned after (scenario G); a backup allocated in a second that already has generations becomes the highest suffix and survives keep and the cap (scenario H, H2); pause suppresses only the schedule and persists beside the world, a manual backup still works while paused, and unpause resumes with exactly one new zip named by list (scenario I); the tick counter resumes from the persisted state beside the world across quit and relaunch, while a fresh world with no state file waits the full interval (scenarios J, J2); an incremental chain's child names its full base and carries only the changed file, status reports chain=2 and list names both, merge folds the chain into one standalone archive, and a fresh world's first backup is full with chain=1 (scenario K); the empty-server policy's online branch still schedules with players online while status reports the observed player count and the persisted empty-period counter (scenarios L, L2); a concrete line from the scratch latest.log is captured as a flat backup.log entry and capture_latest_log=false packs no such entry (scenario M)"
+echo "PASS: scheduled zip valid, keep=1 pruned, disabled schedule silent, manual works while disabled; a 1 B disk cap removes the oldest archive while a 1 TB cap keeps both (the counterfactual); a hand-made ZIP named like a backup survives retention while the older mod archive is removed (scenario E); a stale copy skips both retention passes and leaves the clean restore point over the cap (scenario F); a manual export with the world's own shape survives until an operator adopts it and is pruned after (scenario G); a backup allocated in a second that already has generations becomes the highest suffix and survives keep and the cap (scenario H, H2); pause suppresses only the schedule and persists beside the world, a manual backup still works while paused, and unpause resumes with exactly one new zip named by list (scenario I); the tick counter resumes from the persisted state beside the world across quit and relaunch, while a fresh world with no state file waits the full interval (scenarios J, J2); an incremental chain's child names its full base and carries only the changed file, status reports chain=2 and list names both, merge folds the chain into one standalone archive, and a fresh world's first backup is full with chain=1 (scenario K); the empty-server policy's online branch still schedules with players online while status reports the observed player count and the persisted empty-period counter (scenarios L, L2); a concrete line from the scratch latest.log is captured as a flat backup.log entry and capture_latest_log=false packs no such entry (scenario M); the parsed newest status line reports timers=<configured no_player_backup_timer> (scenario N)"

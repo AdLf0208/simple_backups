@@ -35,6 +35,11 @@ unit-first because a `ctl` launch always has its owner online.
 `backup.log` entry (upstream `captureLatestLog`, default true): one config key, one pure entry-name
 rule and one guarded read after the world walk; 77 tests, scenarios M/M-off, `SELFTEST=latestlog`,
 and all 14 e2e logs green under `--strict`.
+**0.2.10** (2026-11-24) is the empty-server interval (`no_player_backup_timer`, upstream
+`noPlayerBackupTimer`, default 0 → reuse the main interval): one config key, one pure
+`empty_period_interval` rule, one branch in the existing wall-clock due gate and a `timers=` field
+on the existing `saves=` status line; 80 tests, scenario N with `SELFTEST=noplayertimer`, and all
+15 e2e logs green under `--strict`.
 
 **Class + tier** (from `ports/ledger.csv`, per `horizon/docs/modpacks.md`):
 **server-only / logic**. The approach is the **logic shape**: a pure policy
@@ -231,11 +236,13 @@ phase that asserts it.
 | save-overlap retry (`retry_on_save`) | tested | unit test `should_retry`; scenario F forces a real overlap with `ctl save` during a 256 MiB copy (`stale=true`, `saves=6`); scenario C's pause/resume still prints `SKIP` (that path cannot make a save) |
 | `pause` / `unpause` | tested | scenario I: `interval_ticks=40`, a first zip (differential), `/simplebackups pause` → 150 ticks with no new zip and `status` `paused=true` (the `saves=` line, not the whole chat buffer), the persisted flag file read back, a manual `backup` while paused → a fresh zip, `/simplebackups backup unpause` → `paused=false` and exactly one new zip named by `list`; `SELFTEST=pause` (`EXIT:1`) proves the paused-window assertion can fail. The pure rules are `runtime::tests::a_paused_schedule_never_starts_a_backup` and `the_pause_flag_round_trips_through_its_file`, the file round-trip `support::tests::the_pause_flag_is_persisted_beside_the_world` |
 | empty-server policy (`noPlayerBackups` / `noPlayerBackupCount`) | tested | scenario L: `status` reports `players=1` (the harness owner is always online), so the online branch's scheduled backup is asserted and the playerless window is recorded as not producible; scenario L2 runs the same with `no_player_backups = true`; the empty branch and the zero/count cap are proven by `runtime::tests::{an_empty_server_never_schedules_by_default,no_player_count_caps_backups_per_empty_period}`, the file round-trip by `support::tests::the_no_player_counter_is_persisted_beside_the_world` |
+| empty-server interval (`noPlayerBackupTimer`) | tested (unit branches + parsed status) | `runtime::tests::{an_explicit_empty_timer_replaces_the_main_interval,a_zero_empty_timer_falls_back_to_the_main_interval,the_no_player_timer_key_defaults_to_zero_and_round_trips}` prove both branches red-first; scenario N parses the **newest** `saves=` line and asserts `timers=7` from `no_player_backup_timer = 7`, `SELFTEST=noplayertimer` inverts that one value to `EXIT:1`. A genuinely playerless interval is **not producible** (`players=1` always), so neither branch is dressed up as a chat command |
 | `latest.log` → `backup.log` | tested | scenario M: a concrete line is read from the scratch `<home>/logs/latest.log` before `ctl chat "/simplebackups backup"`; the newest archive's flat `backup.log` entry contains that **exact** line (`python3 zipfile`, CRC checked by `check_zip`); the `capture_latest_log = false` counterfactual packs no such entry and `SELFTEST=latestlog` inverts to `EXIT:1`. Pure rules: `backup_log_entry` (one flat name) and `game_log_path` (no absolute/`..`/other file); the glue refuses symlinks and canonical paths outside the game home. |
-| disk reservation before a copy | not ported | gap (upstream's `NotEnoughDiskSpaceException`) |
+| disk reservation before a copy | blocked(no-disk-space-api) | pin `0a875da` has no free-space query: std has none, `horizon-mod-api` has none, and R9 forbids the crate that would supply one — see Slice 10 and `_shared/evidence/simplebackups/reserve-gate-0a875da.log` |
 | persisted schedule counter (tick mode) | tested | scenario J: a zip before quit, the state file beside the world confirmed and seeded to `ticks = 10`, `ctl quit` + relaunch of the same world, `ticks=<restored ≥ 10>` parsed from the newest status line, an empty window sized from the restored value, then a fresh zip (`check_zip` CRC + manifest); `SELFTEST=ticks` (`EXIT:1`) inverts the restored value; pure rules `runtime::tests::{the_persisted_tick_counter_round_trips_through_its_file, a_restored_counter_resumes_the_interval}`, file round-trip `support::tests::the_schedule_counter_is_persisted_beside_the_world`; scenario J2 is the fresh-world differential (no state file, `ticks=0`, needs the full interval) |
 | partial / chains / merge | tested | scenario K: an incremental child names its full base, carries only `World/changed-marker.txt`, `status` reports `chain=2`, `list` names both, `merge` writes a standalone archive; the fresh-world first backup is full with `chain=1`; `SELFTEST=chain` (`EXIT:1`) inverts the base assertion. Pure rules: `entry_changed`, `choose_kind`, `changed_threshold`, `full_timer_due`, `merge_order`, the chain-state and manifest round-trips. |
 | regex ignores | not ported | R9 forbids the `regex` crate a registry dependency would need; implemented without one would mean re-writing a matcher here, deferred |
+| sync-copy mode (`copy_on_server_thread`) | blocked(no-sync-observable) | the harness cannot see the copy in one `ctl` round trip: `ctl chat backup` answers in 44 ms with `{"ok":true}` while a 128 MiB archive appears 10.6 s later and the immediate `list` (379 ms) runs before the backup tick (`ticks=42`, `in_flight=false`, 0 archives) — see Slice 11 and `_shared/evidence/simplebackups/sync-copy-gate-0a875da.log` |
 
 ## Slice 3 (0.2.3, 2026-11-23) — review fix: retention's identity, a stale copy, same-second order
 
@@ -1130,7 +1137,9 @@ works while disabled`.
   at world open (the game's own wall clock is not available through the SDK). The empty-server
   policy is now ported (slice 8) — a `ctl` launch always has the world owner placed, so its
   playerless branch is proven by unit tests, not in game; upstream's separate `noPlayerBackupTimer`
-  stays a deviation (the empty period uses the same interval). `latest.log` capture is now ported (slice 9); Cherished
+  is now ported too (slice 12): an empty period uses that many minutes, 0 reuses the main interval,
+  and its two branches are proven red-first by unit tests (the harness still cannot be playerless).
+  `latest.log` capture is now ported (slice 9); Cherished
   Worlds/mc2discord and regex ignores stay deferred. The disk cap
   (slice 2), `pause`/`unpause` (slice 5), the persisted counter (slice 6) and incremental
   chains/merge (slice 7) are now ported. Chain children are not standalone restore points; the flat
@@ -1204,7 +1213,8 @@ works while disabled`.
 - **Deferred (as of the 2026-11-03 analysis; pause and the disk cap were later ported — slices 5
   and 2; the persisted schedule slice 6, chains/merge slice 7, empty-server policy slice 8):**
   Cherished Worlds, mc2discord, regex ignores, sync-copy mode, and upstream's
-  separate `noPlayerBackupTimer`. (`latest.log` capture was later ported — slice 9.)
+  separate `noPlayerBackupTimer`. (`latest.log` capture was later ported — slice 9; the empty-server
+  interval was later ported — slice 12; sync-copy stays `blocked(no-sync-observable)` — slice 11.)
 - **Licence:** Apache-2.0 permits derivatives, but the port stays local-only
   until the maintainer approves publishing (ARCHITECTURE.md §8). The scaffold's
   `Cargo.toml` currently declares `MIT` while upstream is Apache-2.0; the
@@ -1377,9 +1387,10 @@ remote runner. Evidence in `../_shared/evidence/simplebackups/`.
    `target/`, which the disk-hygiene rule cleans); the transcript quoted in this file is the record.
 4. Still deferred: Cherished Worlds/mc2discord and regex ignores (**the disk
    cap is done — *Slice 2 (0.2.2)* —, pause/unpause — *Slice 5 (0.2.5)* —, the persisted tick
-   schedule — *Slice 6 (0.2.6)* —, incremental chains/merge — *Slice 7 (0.2.7)* —, and the
-   empty-server policy — *Slice 8 (0.2.8)*; only the regex half of the old combined gap remains,
-   and R9 forbids the crate it would need**).
+   schedule — *Slice 6 (0.2.6)* —, incremental chains/merge — *Slice 7 (0.2.7)* —, the
+   empty-server policy — *Slice 8 (0.2.8)* —, `latest.log` — *Slice 9 (0.2.9)* — and the empty-server
+   interval — *Slice 12 (0.2.10)*; only the regex half of the old combined gap remains, and R9
+   forbids the crate it would need**). Disk reservation and sync-copy are `blocked` (slices 10/11).
 5. `/simplebackups status` is the only route for a config warning; there is no log file.
 6. `side = "both"`, so the mod is installed on a client too; that is required for single player and
    a LAN host (their integrated server belongs to the client installation).
@@ -1559,4 +1570,295 @@ Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven
 > the guarded read are all that changed; no new hook, crate, block entity or menu. 77 tests;
 > scenario M proves an exact line from the scratch log is in the archive, the key-off scene packs no
 > entry, and `SELFTEST=latestlog` proves the assertion can fail. 65,996 B, sha256 `53a767bb…`.
+
+## Slice 10 (2026-11-24) — disk reservation before a copy: `blocked(no-disk-space-api)`
+
+**Gap line.** Coverage table: *"disk reservation before a copy | not ported | gap (upstream's
+`NotEnoughDiskSpaceException`)"*. Class **server-only**, tier **logic**: one reserve key, one pure
+required-bytes rule and one guard before spawning the worker; no new hook, crate, block entity or
+menu. The shape fits the tier; the **pin does not expose the measurement the guard needs**, so the
+slice stops at the first measurement gate rather than guessing a size or faking a guard.
+
+**Upstream rule, read first from the pack's source** (branch `1.21.1`, head
+`bf04de3e7b3e05504ee5cc974cf45833b0d4b9a4`, re-cloned read-only to
+`ports/_shared/upstream/simplebackups-src` and deleted after these findings):
+
+- `BackupThread.java:56` — `public static final long BACKUP_BUFFER_SIZE = 128L * 1024 * 1024;
+  // 128 MB`. This is the whole reserve: a fixed 128 MiB, **not** a config key upstream exposes.
+- `BackupThread.java:374` — `FileStore fileStore = Files.getFileStore(outputFile);` — the usable
+  space is queried from the **filesystem of the output file**, through Java NIO's `FileStore`.
+- `BackupThread.java:395-398` — for each file about to be zipped:
+  `fileStore.getUsableSpace() - attrs.size() - BACKUP_BUFFER_SIZE < 0L` →
+  `throw new NotEnoughDiskSpaceException("Not enough space on disk to create backup")`. The guard is
+  **per file**, and the required bytes are that file's own size plus the fixed 128 MiB buffer.
+- `BackupThread.java:225-227` — the catch broadcasts `simplebackups.not_enough_space` and deletes
+  the partial `backupFilePath`, leaving earlier archives intact.
+- `exception/NotEnoughDiskSpaceException.java` is an `IOException` subtype; there is no retry or
+  fallback path.
+
+So the faithful rule is: `usable_space(output volume) >= next_file_size + 128 MiB`, checked before
+each file is copied; a failure publishes no archive and reports the reservation error.
+
+**First measurement gate — FAILED (no free-space source reachable under R9).** Evidence logged in
+`../_shared/evidence/simplebackups/reserve-gate-0a875da.log`:
+
+1. The port's only dependency is `horizon-mod-api` (`Cargo.toml`), so R9 permits no `libc`/`nix`/
+   `statvfs` crate.
+2. A case-insensitive search of the whole pinned SDK (`ports/_shared/sdk/0a875da/crates/`, 1,636
+   files, and `surface.json`, 6.8 MB) for `statvfs|statfs|f_bavail|f_bfree|get_usable_space|
+   usable_space|free_disk|disk_free|free_space|available_space|disk_capacity` returned only two
+   `available_space` hits, both the unrelated GUI field `ScreenRenderInventoryMobEffectsEvent.
+   available_space: i32` (`surface.json:45375`, `hooks/screen_preedit_effects.rs:32`). No disk or
+   filesystem-capacity method exists in the host surface.
+3. The only `space_for` in the SDK is `ItemStorage::space_for(host, &ItemResource) ->
+   Result<u64, StorageError>` (`wire_guest_generated.rs:1883`, `horizon-mod-vocab/src/item/storage.rs:144`)
+   — free **item** slots in an inventory, not bytes on a volume.
+4. The only space/path-bearing host methods found are `native_config_dir`, `native_data_dir`,
+   `native_data_pack_files`, `native_world_dir`; none reports capacity.
+5. Rust `std` (rustc 1.97.0) has no free-space query: `std::fs::free_space(".")` fails to compile
+   (`E0425, cannot find function free_space in module std::fs`), and no `statvfs` binding exists in
+   the shipped std source. `MetadataExt::blocks()/blksize()` compile but describe a single file's
+   allocation, never free filesystem bytes.
+
+**Decision.** `blocked(no-disk-space-api)`. There is no honest value to plug into
+`usable >= size + 128 MiB` at this pin: a configured "reserve" without a measured free-space value
+cannot guard anything, and a write-to-failure probe would mutate the volume and is not a measurement.
+Per the brief, the slice stops here instead of guessing a size or dressing a chat command up as a
+reservation test. **No code, config, version, manifest or package changed** — the delivered artifact
+is still 0.2.9 (65,996 B, sha256 `53a767bb1c2a55915391ea69630fd4f36bad5a30ec8727bac820e2ad8bb31606`;
+`fits --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` → `made for`,
+`fits --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` → `fits`). The 0.2.4–0.2.9 rules are
+untouched, so none can regress. The in-game assertion (a reserve larger than scratch free space
+publishes no `.zip` and the newest `status` line reports the error; zero reserve publishes one) is
+**not runnable** here: without a free-space query the guard cannot exist, and a synthetic
+`SELFTEST=reserve` would be a fake.
+
+**Unblock condition.** A pinned `horizon-mod-api` method that returns the usable bytes of a volume
+(or an equivalent `statvfs`-style helper the launcher accepts) would let the slice proceed: add
+`reserve_bytes = "128 MB"` (upstream's fixed buffer, made configurable here), the pure
+`required_bytes(file_size, reserve)` rule red-first, the per-file guard before the worker copies,
+and the fail-capable two-direction `ctl chat` scene. Re-check this at every new pin.
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices
+
+## Slice 11 (2026-11-24) — sync-copy mode (`copy_on_server_thread`): `blocked(no-sync-observable)`
+
+**Gap line.** *Deferred (notes.md, upstream source)*: "Cherished Worlds, mc2discord, regex
+ignores, sync-copy mode, and upstream's separate `noPlayerBackupTimer`". Class **server-only**,
+tier **logic** (ledger authority): one config key plus a branch choosing whether the copy runs
+inline at the save-complete moment or on the current worker thread — no new hook, block entity,
+menu, crate or carried content. The shape fits the tier. **The first gate fails**: the harness
+cannot distinguish the two thread placements within one `ctl` round trip, so the slice stops
+before adding a config key whose only effect would be unobservable.
+
+**The branch as read, upstream first.** `BackupThread.java:356-363` (`1.21.1` head
+`bf04de3e7b3e05504ee5cc974cf45833b0d4b9a4`, recorded in `ports/_shared/upstream/simplebackups/
+FINDINGS.md` §1.4/§1.7) runs the save with `server.executeBlocking(() ->
+server.saveEverything(true, false, true))` — the save **blocks the server thread**, then the zip,
+log capture, retention and disk accounting run on the `Thread` named `SimpleBackups`. Upstream
+has **no** `copy_on_server_thread` key (the config inventory in §1.1 has none); the mode is a
+campaign idea from §3/Q3 of the same findings — "copy synchronously on the server thread … at the
+cost of a tick stall" — which the brief makes the next implementable gap. In this port the same
+shape is: `perform_command` queues `pending` (`support::run_command`); `ServerTickEnd` takes it
+and `start_backup` asks for a save (`request_save`); `world_saved` calls `begin_copy`, which
+spawns the worker (`support.rs:683`, `thread::spawn`); the worker writes `.zip.part` and the next
+`ServerTickEnd` publishes it. The flag would move the `run_backup` call from that worker into
+`on_world_saved` (the save-complete moment) while leaving the *moment* unchanged.
+
+**First measurement gate — FAILED (no in-one-round-trip observable).** Evidence logged in
+`../_shared/evidence/simplebackups/sync-copy-gate-0a875da.log` (probe
+`tools/probe-synccopy.sh`, 0.2.9 game, 128 MiB `payload.bin`, `save_before_backup=true`,
+`compression_level=1`, schedule disabled, scratch under `E2E_TMP`):
+
+```
+payload-bytes: 134217728
+before-status: saves=0 retries=0 stale=false paused=false ticks=42 chain=0 players=1 empty_backups=0
+backup-chat-reply: {"ok":true}
+backup-chat-seconds: 0.044
+immediate-list-seconds: 0.379
+immediate-list-replies: Backup queued. disk=0 B ... saves=0 ... in_flight=false last=- error=- ...
+archives-at-immediate-list: 0
+archive-appears-after-backup-reply-seconds: 10.634
+archive-count: 1
+after-status: ... ticks=216 chain=1 ...
+```
+
+Three independent facts make the proposed assertion impossible to satisfy honestly:
+
+1. **`ctl chat "/simplebackups backup"` returns in 44 ms** with `{"ok":true}` — the reply is the
+   command dispatcher's acknowledgment, not the backup's. `perform_command` only queues a
+   request; the copy is never executed in that hook (the port's own design note forbids saving
+   inside a player-state-swapped command hook). No placement of the copy — inline or worker —
+   can make this call wait for the archive, so "must not return until the archive exists" cannot
+   be true of sync mode either.
+2. **The copy starts after the reply, at save-complete.** The immediate `list` (379 ms) still
+   reads `ticks=42`, `in_flight=false` and names **0** archives — the `ServerTickEnd` that starts
+   the request and the save that completes it have not happened yet in that window. An inline
+   copy at `world_saved` has not begun, so the immediate `list` cannot see it even with a huge
+   payload.
+3. **The payload is large enough; the gap is not size.** At 128 MiB the archive appeared 10.634 s
+   after the chat reply — ~28× the whole immediate-list window and ~240× the chat round trip.
+   A `wait`-timing difference would only be visible if a `ctl` command were processed *during* an
+   inline copy, which the queued command flow does not arrange; dressing that latency up as
+   "the command waited for the archive" would be false evidence.
+
+**Decision.** `blocked(no-sync-observable)`. Per the brief, the gate stops the slice here rather
+than inventing an observable. **No code, config, version, manifest or package changed** — the
+delivered artifact is still 0.2.9 (65,996 B, sha256
+`53a767bb1c2a55915391ea69630fd4f36bad5a30ec8727bac820e2ad8bb31606`;
+`fits --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` → `made for`,
+`fits --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` → `fits`), `verify-sdk-package.py` → `1/1`
+(`package matches the tree`), and `check-e2e-logs.py simplebackups-e2e --strict` → `logs=14 ok=14`
+so the 0.2.4–0.2.9 rules cannot have regressed. The pure branch would be trivial and therefore
+uninformative: its only effect is a thread switch, whose observable difference is server-thread
+stall time, not a game state an assertion could read.
+
+**Unblock condition.** A harness route that drives the backup **synchronously through the command
+reply** (so the copy really begins before the `ctl chat` returns), or a game-visible marker for
+"this copy ran on the server thread" (a status field set at the save-complete moment that a
+`ctl` round trip can read after the copy), would make the two placements distinguishable. With
+either, add `copy_on_server_thread` (default `false`, today's behaviour), the red-first pure rule,
+the inline branch, and a `SELFTEST=synccopy` inversion. Re-check this gate at every new pin.
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices
+
+## Slice 12 (0.2.10, 2026-11-24) — the empty-server interval (`noPlayerBackupTimer`)
+
+**Gap line.** The *Deferred* bullet (and *Gaps after the migration* item 4): *"Cherished Worlds,
+mc2discord, regex ignores, sync-copy mode, and upstream's separate `noPlayerBackupTimer`"* — this is
+the last implementable family there. Class **server-only**, tier **logic** (ledger authority):
+one `Settings` key, one pure `empty_period_interval` rule, one branch in the existing wall-clock
+due gate, and one field on the existing `saves=` status line. No new hook, crate, block entity,
+menu, carried content or registry dependency. Disk reservation stays `blocked(no-disk-space-api)`
+(slice 10) and sync-copy `blocked(no-sync-observable)` (slice 11) — both measured, not retried;
+regex ignores stay `not ported` (R9 forbids the crate).
+
+**Artefact rule, read first** from `CommonConfig.java` at the pack's `1.21.1` head
+`bf04de3e7b3e05504ee5cc974cf45833b0d4b9a4` (fetched read-only from the public source; the
+earlier clone was deleted after analysis):
+
+- `:90-91` — `noPlayerBackupTimer = builder.comment("The time between two backups when no player is
+  online. 0 means the same as the \"timer\" setting.").defineInRange("noPlayerBackupTimer", 0, 0,
+  Integer.MAX_VALUE)` — default **0**, in **minutes**, 0 meaning "use `timer`".
+- `:151-157` — `getTimer(boolean arePlayersOnline)`: `int i = noPlayerBackupTimer.get(); if (i == 0)
+  { i = timer.get(); } return (long)(arePlayersOnline ? timer.get() : i) * 60 * 1000;`
+
+So the effective minutes are `online ? timer : (empty == 0 ? timer : empty)`, and the millisecond
+interval is minutes × **60 × 1000**. The port's existing `due_by_millis` already multiplies by
+60_000, so no new conversion constant was introduced; `interval_ticks > 0` stays the test override
+and is untouched. Upstream's tick-counter mode derives from `timerMinutes * 20 * 60`
+(`BackupThread.java:115-121`), which is the same minutes value fed to the same gate.
+
+**Port decisions.** `Settings` gains `no_player_backup_timer_minutes: u64` (default 0); `parse`
+accepts the key as an unsigned integer (a bad value keeps the default and warns) and `to_toml`
+writes it back. `runtime::empty_period_interval(players_online, main_minutes, empty_minutes)`
+encodes upstream's selection. The wall-clock branch of the due gate in `support::on_tick` now uses
+`empty_period_interval(players > 0, interval_minutes, no_player_backup_timer_minutes)` instead of the
+raw `interval_minutes`, so an explicit empty timer replaces the interval only while nobody is online
+and 0 reuses the main one. `/simplebackups status` appends `timers=<configured>` to the existing
+`saves=` line; every earlier substring assertion stays valid. The 0.2.2–0.2.9 behaviour is otherwise
+unchanged.
+
+**Red → green.** Three failing tests first, against a deliberately wrong stub (it ignored an
+explicit empty timer and let 0 fall through to 0), verbatim from `sdk-test-red-noplayertimer.log`:
+
+```
+---- runtime::tests::a_zero_empty_timer_falls_back_to_the_main_interval stdout ----
+thread 'runtime::tests::a_zero_empty_timer_falls_back_to_the_main_interval' (828647) panicked at src/runtime.rs:2076:9:
+assertion `left == right` failed
+  left: 0
+ right: 120
+
+---- runtime::tests::an_explicit_empty_timer_replaces_the_main_interval stdout ----
+thread 'runtime::tests::an_explicit_empty_timer_replaces_the_main_interval' (828649) panicked at src/runtime.rs:2070:9:
+assertion `left == right` failed
+  left: 120
+ right: 7
+
+---- runtime::tests::the_no_player_timer_key_defaults_to_zero_and_round_trips stdout ----
+thread 'runtime::tests::the_no_player_timer_key_defaults_to_zero_and_round_trips' (828688) panicked at src/runtime.rs:2090:9:
+the key must be known: ["unknown key: no_player_backup_timer"]
+
+test result: FAILED. 77 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+```
+
+Both `empty_period_interval` branches are proved red-first there: explicit timer (`false,120,7 → 7`)
+and 0 fallback (`false,120,0 → 120`, plus the online wins case). Green: **80 passed, 0 failed**
+(`sdk-test.log`), clippy `-D warnings` 0 warnings (`sdk-clippy.log`), `fmt --check` clean
+(`sdk-fmt.log`). `cargo fmt` first found two real diffs (the new function signature and the import
+list); both were formatted, not allowed.
+
+**In game.** Launcher build `native-0a875da-b8e99fd6e39a`, `Compiling simplebackups (1 of 1)`,
+every packed source byte-identical to this tree (`build-record.txt`). Scenario N's transcript
+(`e2e-launcher.log`):
+
+```
+== scenario N: the parsed newest status line reports the configured no_player_backup_timer ==
+no-player-timer status (newest): saves=0 retries=0 stale=false paused=false ticks=24 chain=0 players=1 empty_backups=0 timers=7
+parsed newest status line: timers=7 (configured no_player_backup_timer=7)
+harness: players=1; a genuinely playerless interval is not producible by ctl — both empty_period_interval branches are proved red-first by unit tests, not dressed up as a chat command
+PASS: … the parsed newest status line reports timers=<configured no_player_backup_timer> (scenario N) …
+EXIT:0
+```
+
+`SELFTEST=noplayertimer` (`e2e-launcher-noplayertimer-selftest.log`) inverts the one parsed value and
+ends `FAIL: NOPLAYERTIMER SELFTEST: the newest status line reported timers=7 — the assertion is alive`
++ `EXIT:1`. **Harness limit (measured, as in slice 8):** `ctl launch` opens a single-player
+integrated world whose owner is placed (`players=1` in every N/L/L2 run), so a genuinely playerless
+interval cannot be produced; no chat command is presented as one. All fourteen previous scenario
+families stayed green on the 0.2.10 game; control `EXIT:1`, `SELFTEST=1`, `SELFTEST=pause`,
+`SELFTEST=ticks`, `SELFTEST=chain`, `SELFTEST=noplayer`, `SELFTEST=latestlog`,
+`SELFTEST=noplayertimer`, `STALE_SELFTEST=1`, `ADOPT_NEGATIVE=1`, `SAME_SECOND_NEGATIVE=1` all
+`EXIT:1`. `check-e2e-logs.py simplebackups-e2e --strict` → `logs=15 ok=15 missing-exit=0 bad-exit=0`.
+
+**Remote build path.** Every cargo ladder step forwarded through
+`ports/tools/build-slot.sh run --job W1-simplebackups --port ports/simplebackups --step …` to host
+**AdLf-PC** (`build-slot: forwarding … to the remote runner`); `BUILD_LOCAL=1` was never set. The
+launcher native build and every game leg stayed local (`FORWARDED=1` keep-local marker on the
+launcher build), because the second box has no launcher/Nightly cache. All e2e scratch dirs came
+from `E2E_TMP` under `~/.cache/horizon-e2e/scratch` — never `/tmp`.
+
+### Package 0.2.10
+
+| | |
+|---|---|
+| version | **0.2.10** (`horizon-mod.toml` + `Cargo.toml`) |
+| bytes | **66,949 B** |
+| sha256 | `ab6e2312d30142d2ae45476c735abd8505ec790668a1d2c01d86df62f608b737` |
+| entries | **10** — `horizon-mod.toml`, `Cargo.toml`, `LICENSE`, `LICENSE-NOTICE.md`, `README.md`, `src/{lib,runtime,support,zip}.rs`, `uses.json`; **no `Cargo.lock`** |
+| reproducible | two builds, each after `rm -f Cargo.lock`: `cmp` identical, same sha |
+| `check` | `simplebackups 0.2.10 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)`, 66,949 B, exit 0 |
+| `fits --build 0a875da91dbb0fdcb7ba8c42c11341aa229af51a` | `0a875da  made for` |
+| `fits --build 0b14f8acfd97fa2c750e42795249dcc981178ca4` | `0b14f8a  fits` — the real gate |
+| tests | **80 passed, 0 failed** (46 `runtime`, 14 `support`, 12 `zip`) |
+| `verify-sdk-package.py simplebackups` | `1/1`, `package matches the tree`, R9 clean |
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices
+
+### Changelog (0.2.10)
+
+> **0.2.10 — the empty-server interval.** `no_player_backup_timer` (upstream's
+> `noPlayerBackupTimer`, minutes, default 0) gives an empty server its own interval: a nonzero value
+> replaces `interval_minutes` while the player list is empty, 0 reuses the main interval, and a
+> player online always uses the main interval — upstream's `getTimer(arePlayersOnline)` selection.
+> The pure `empty_period_interval` rule and the wall-clock due gate are the only behaviour changes;
+> `/simplebackups status` now reports `timers=<configured>` beside the other counters. 80 tests;
+> scenario N parses the newest status line for `timers=7`, `SELFTEST=noplayertimer` proves that
+> assertion can fail, and both interval branches are proved red-first by unit tests because a `ctl`
+> launch always has its owner online. 66,949 B, sha256 `ab6e2312…b737`.
+
+## Next slice
+
+No implementable family remains in this port's gap list at pin `0a875da`. The three survivors are
+all measured blocks or out-of-scope: **disk reservation** — `blocked(no-disk-space-api)`, std and
+the pinned `horizon-mod-api` have no volume-space query and R9 forbids a `statvfs` crate (gate log
+`../_shared/evidence/simplebackups/reserve-gate-0a875da.log`); **sync-copy** —
+`blocked(no-sync-observable)`, the `ctl chat` reply returns in 44 ms before any copy starts, so the
+two thread placements cannot be distinguished in one round trip (gate log
+`../_shared/evidence/simplebackups/sync-copy-gate-0a875da.log`); **regex ignores** — `not ported`
+under R9 (a regex needs a registry dependency). **Cherished Worlds / mc2discord** need mods that are
+not in the registry, so they fail slice-selection rule 4. Re-check the two `blocked` gates at every
+new pin: the unblock condition is a host free-space method for one and a synchronous command reply
+or a thread-placement marker for the other. If a new pin supplies either, the next slice is its
+re-verification (replace the fallback, re-run the ladder and the differential, update the record).
 

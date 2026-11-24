@@ -31,12 +31,12 @@ use crate::runtime::{
     ADOPTION_FILE, Adoption, Archive, BACKUP_LOG_ENTRY, BackupKind, CHAIN_FILE, ChainState,
     GAME_LOG_RELATIVE, MANIFEST_ENTRY, NO_PLAYER_FILE, PAUSE_FILE, SCHEDULE_FILE, Settings,
     backup_file_name, backup_log_entry, cap_removals, chain_manifest, changed_threshold,
-    choose_kind, copy_is_stale, due_by_millis, due_by_ticks, entry_changed, entry_name,
-    format_adoptions, format_chain, format_no_player_count, format_paused, format_schedule_ticks,
-    format_size, format_size_setting, full_timer_due, game_log_path, is_adopted,
-    manifest_identifies, merge_order, parse, parse_adoptions, parse_archive, parse_chain,
-    parse_no_player_count, parse_paused, parse_schedule_ticks, prune, schedule_progress,
-    scheduled_backup_permitted, should_skip, to_toml,
+    choose_kind, copy_is_stale, due_by_millis, due_by_ticks, empty_period_interval, entry_changed,
+    entry_name, format_adoptions, format_chain, format_no_player_count, format_paused,
+    format_schedule_ticks, format_size, format_size_setting, full_timer_due, game_log_path,
+    is_adopted, manifest_identifies, merge_order, parse, parse_adoptions, parse_archive,
+    parse_chain, parse_no_player_count, parse_paused, parse_schedule_ticks, prune,
+    schedule_progress, scheduled_backup_permitted, should_skip, to_toml,
 };
 use crate::zip::{ZipWriter, entry_names, read_entry, read_entry_all};
 
@@ -516,7 +516,15 @@ pub fn on_server_tick(host: &mut dyn ServerHost, world_running: bool) {
         ) && if core.cfg.interval_ticks > 0 {
             due_by_ticks(core.last_tick, core.ticks, core.cfg.interval_ticks)
         } else {
-            due_by_millis(core.last_ms, now_ms(), core.cfg.interval_minutes)
+            // Upstream's `getTimer(arePlayersOnline)`: an explicit `noPlayerBackupTimer`
+            // replaces the main interval for an empty period; 0 means use `timer`, and
+            // a player online always uses `timer`. Tick mode stays the test override.
+            let interval_minutes = empty_period_interval(
+                players > 0,
+                core.cfg.interval_minutes,
+                core.cfg.no_player_backup_timer_minutes,
+            );
+            due_by_millis(core.last_ms, now_ms(), interval_minutes)
         };
         if manual.is_none() && !due {
             return;
@@ -1483,9 +1491,11 @@ fn status_lines() -> Vec<String> {
     // stay valid. `ticks` is the persisted progress toward the next scheduled backup: a parsed
     // reply after a restart proves the counter resumed instead of restarting at zero. `players`
     // and `empty_backups` expose the empty-server policy's inputs: the server player list and the
-    // persisted per-period count (a launch whose owner is online reports players>=1).
+    // persisted per-period count (a launch whose owner is online reports players>=1). `timers` is
+    // the configured `noPlayerBackupTimer` (upstream's empty-period interval in minutes); it is
+    // reported beside the other counters so a parsed status reply proves the value is readable.
     lines.push(format!(
-        "saves={} retries={} stale={} paused={} ticks={} chain={} players={} empty_backups={}",
+        "saves={} retries={} stale={} paused={} ticks={} chain={} players={} empty_backups={} timers={}",
         core.save_seq,
         core.retries,
         core.stale,
@@ -1493,7 +1503,8 @@ fn status_lines() -> Vec<String> {
         schedule_progress(core.ticks, core.last_tick),
         core.chain.len,
         core.players,
-        core.empty_backups
+        core.empty_backups,
+        core.cfg.no_player_backup_timer_minutes
     ));
     // The disk cap is a config key of its own, so it gets a line of its own: the folder's size after
     // the last publish, the cap it is measured against, and whether it is still over it. The

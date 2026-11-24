@@ -76,14 +76,16 @@ the game glue and `src/zip.rs` the archive writer. The launcher compiles it agai
   backups (default 1; 0 disables) during one empty period; the count is incremented when a backup
   **starts** while empty and resets when a player joins, and it is persisted in
   `simplebackups-no-player.txt` beside the world (upstream's `backupsSinceLastPlayerJoined` in its
-  `BackupData` SavedData). A manual backup is unaffected. Upstream's separate `noPlayerBackupTimer`
-  is not ported: the empty period uses the same `interval_ticks`/`interval_minutes`. `/simplebackups
-  status` reports `players=<n> empty_backups=<n>`.
+  `BackupData` SavedData). A manual backup is unaffected. The empty period can use a **different
+  interval** with `no_player_backup_timer` (minutes, upstream's `noPlayerBackupTimer`, default 0):
+  a nonzero value replaces `interval_minutes` while nobody is online; 0 reuses the main interval,
+  and a player online always uses the main interval (upstream's `getTimer(arePlayersOnline)`).
+  `/simplebackups status` reports `players=<n> empty_backups=<n> timers=<configured>`.
 - **Config** `config/simplebackups.toml`: `enabled`, `interval_minutes`, `interval_ticks`, `keep`,
   `max_disk_size`, `compression_level`, `save_before_backup`, `retry_on_save`, `broadcast`,
   `backups_dir`, `ignored_paths`, `ignored_files`, `backup_type`, `full_backup_timer`,
-  `no_player_backups`, `no_player_backup_count`, `capture_latest_log`. A missing file is written
-  with the defaults.
+  `no_player_backups`, `no_player_backup_count`, `no_player_backup_timer`, `capture_latest_log`. A
+  missing file is written with the defaults.
 
 ## Notes on this port
 

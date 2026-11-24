@@ -36,6 +36,9 @@ pub struct Settings {
     /// How many empty-server backups per period until a player joins (upstream
     /// `noPlayerBackupCount`; 0 disables them).
     pub no_player_backup_count: u64,
+    /// Empty-server interval in minutes (upstream `noPlayerBackupTimer`; 0 means
+    /// the same as `interval_minutes`).
+    pub no_player_backup_timer_minutes: u64,
     /// Append the game's `logs/latest.log` to every archive as `backup.log`
     /// (upstream `captureLatestLog`, default true).
     pub capture_latest_log: bool,
@@ -61,6 +64,8 @@ impl Default for Settings {
             full_backup_timer_minutes: DEFAULT_FULL_BACKUP_TIMER_MINUTES,
             no_player_backups: false,
             no_player_backup_count: 1,
+            // Upstream `noPlayerBackupTimer` defaults to 0 (use `timer`).
+            no_player_backup_timer_minutes: 0,
             // Upstream `captureLatestLog` defaults to true.
             capture_latest_log: true,
         }
@@ -201,6 +206,10 @@ pub fn parse(input: &str) -> (Settings, Vec<String>) {
                 Ok(parsed) => config.no_player_backup_count = parsed,
                 Err(_) => warnings.push(format!("no_player_backup_count: not a number: {value}")),
             },
+            "no_player_backup_timer" => match value.parse::<u64>() {
+                Ok(parsed) => config.no_player_backup_timer_minutes = parsed,
+                Err(_) => warnings.push(format!("no_player_backup_timer: not a number: {value}")),
+            },
             "capture_latest_log" => match parse_bool(value) {
                 Some(parsed) => config.capture_latest_log = parsed,
                 None => warnings.push(format!("capture_latest_log: not a boolean: {value}")),
@@ -281,6 +290,10 @@ pub fn to_toml(config: &Settings) -> String {
         config.no_player_backup_count
     ));
     out.push_str(&format!(
+        "no_player_backup_timer = {}\n",
+        config.no_player_backup_timer_minutes
+    ));
+    out.push_str(&format!(
         "capture_latest_log = {}\n",
         config.capture_latest_log
     ));
@@ -296,6 +309,20 @@ pub fn due_by_ticks(last_tick: u64, now_tick: u64, interval: u64) -> bool {
 pub fn due_by_millis(last_ms: u64, now_ms: u64, interval_minutes: u64) -> bool {
     interval_minutes > 0
         && now_ms.saturating_sub(last_ms) >= interval_minutes.saturating_mul(60_000)
+}
+
+/// The schedule interval, in minutes, for the current player presence. Upstream's
+/// `CommonConfig.getTimer(arePlayersOnline)` (`CommonConfig.java:151-157`) takes
+/// `noPlayerBackupTimer`, replaces it with `timer` when it is 0, and then picks
+/// `timer` whenever a player is online: `(online ? timer : i) * 60 * 1000`. This
+/// returns the minutes; the caller's `due_by_millis` supplies the × 60 000.
+#[must_use]
+pub fn empty_period_interval(players_online: bool, main_minutes: u64, empty_minutes: u64) -> u64 {
+    if players_online || empty_minutes == 0 {
+        main_minutes
+    } else {
+        empty_minutes
+    }
 }
 
 /// The persisted empty-server counter, stored beside the world. Upstream keeps
@@ -2044,5 +2071,42 @@ mod tests {
             None,
             "only latest.log is captured"
         );
+    }
+
+    #[test]
+    fn an_explicit_empty_timer_replaces_the_main_interval() {
+        // Upstream `getTimer(false)`: noPlayerBackupTimer is the empty period's interval.
+        assert_eq!(empty_period_interval(false, 120, 7), 7);
+    }
+
+    #[test]
+    fn a_zero_empty_timer_falls_back_to_the_main_interval() {
+        // Upstream `CommonConfig.java:153-155`: 0 means the same as `timer`.
+        assert_eq!(empty_period_interval(false, 120, 0), 120);
+        // With a player online the main timer always wins, whatever the empty value.
+        assert_eq!(empty_period_interval(true, 120, 7), 120);
+        assert_eq!(empty_period_interval(true, 120, 0), 120);
+    }
+
+    #[test]
+    fn the_no_player_timer_key_defaults_to_zero_and_round_trips() {
+        assert_eq!(
+            Settings::default().no_player_backup_timer_minutes,
+            0,
+            "upstream's default is 0"
+        );
+        let (config, warnings) = parse("no_player_backup_timer = 7\n");
+        assert!(warnings.is_empty(), "the key must be known: {warnings:?}");
+        assert_eq!(config.no_player_backup_timer_minutes, 7);
+        let text = to_toml(&config);
+        assert!(
+            text.contains("no_player_backup_timer = 7"),
+            "the key must be written back: {text}"
+        );
+        let (again, warnings) = parse(&text);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(again, config);
+        let (_, warnings) = parse("no_player_backup_timer = -1\n");
+        assert_eq!(warnings.len(), 1, "bad values keep the default and warn");
     }
 }

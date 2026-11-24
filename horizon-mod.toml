@@ -1,6 +1,6 @@
 id = "simplebackups"
 name = "Simple Backups"
-version = "0.2.9"
+version = "0.2.10"
 description = """Scheduled, on-disk backups of the whole world, with retention. A backup saves the open
 world, then a worker thread walks the world folder into a .zip.part, publishes it as a .zip and
 prunes the oldest ones down to keep. A copy a save cycle overlapped is thrown away and redone. The
@@ -15,7 +15,10 @@ port marked itself, or a marker-less one an operator adopted. With noPlayerBacku
 default) the schedule is silent while nobody is online; opting in allows noPlayerBackupCount backups
 per empty period until a player joins, with that counter persisted beside the world. The game's
 logs/latest.log is appended to every archive as a flat backup.log entry (capture_latest_log, default
-true), from a path derived from the game's own directory with symlinks and out-of-root paths refused."""
+true), from a path derived from the game's own directory with symlinks and out-of-root paths refused.
+An empty period uses noPlayerBackupTimer minutes when set; 0 reuses the main interval (upstream's
+default), a player online always uses the main interval, and /simplebackups status reports
+timers=<configured> beside the other counters."""
 authors = ["ChaoticTrials", "AdLf0208"]
 license = "Apache-2.0"
 # A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
